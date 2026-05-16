@@ -1,3 +1,5 @@
-feedparser>=6.0
-google-genai>=1.0
-python-dotenv>=1.0
+# Pinned versions for supply-chain safety (tested 2026-05-16)
+feedparser==6.0.12
+google-genai==2.2.0
+python-dotenv==1.2.2
+requests==2.34.1

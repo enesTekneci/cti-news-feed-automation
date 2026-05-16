@@ -7,6 +7,7 @@ analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
 
 import os
 import re
+import html
 import logging
 import logging.handlers
 import smtplib
@@ -15,6 +16,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -397,6 +399,88 @@ def extract_versions(text: str) -> list[str]:
     return found
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  HTML SANITIZATION (Gemini output → email injection protection)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_ALLOWED_TAGS = frozenset([
+    "div", "p", "h1", "h2", "h3", "h4", "strong", "em", "a", "br",
+    "span", "ul", "ol", "li", "table", "tr", "td", "th", "thead", "tbody",
+])
+
+_ALLOWED_ATTRS = frozenset(["style", "href", "class"])
+
+# Dangerous patterns in attribute values
+_DANGEROUS_ATTR_VALUE = re.compile(
+    r"javascript\s*:|data\s*:|vbscript\s*:|expression\s*\(|url\s*\(",
+    re.IGNORECASE,
+)
+
+
+class _HTMLSanitizer(HTMLParser):
+    """Whitelist-based HTML sanitizer to prevent XSS via Gemini output."""
+
+    def __init__(self):
+        super().__init__()
+        self.result: list[str] = []
+        self._strip_depth = 0  # depth inside a stripped tag
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
+        tag_lower = tag.lower()
+        if tag_lower not in _ALLOWED_TAGS:
+            self._strip_depth += 1
+            return
+        safe_attrs: list[str] = []
+        for attr_name, attr_value in attrs:
+            attr_name_lower = attr_name.lower()
+            if attr_name_lower not in _ALLOWED_ATTRS:
+                continue
+            if attr_value and _DANGEROUS_ATTR_VALUE.search(attr_value):
+                continue
+            # Validate href specifically
+            if attr_name_lower == "href" and attr_value:
+                if not attr_value.startswith(("http://", "https://", "mailto:")):
+                    continue
+            escaped_value = html.escape(attr_value or "", quote=True)
+            safe_attrs.append(f'{attr_name_lower}="{escaped_value}"')
+        attrs_str = (" " + " ".join(safe_attrs)) if safe_attrs else ""
+        self.result.append(f"<{tag_lower}{attrs_str}>")
+
+    def handle_endtag(self, tag: str):
+        tag_lower = tag.lower()
+        if tag_lower not in _ALLOWED_TAGS:
+            if self._strip_depth > 0:
+                self._strip_depth -= 1
+            return
+        self.result.append(f"</{tag_lower}>")
+
+    def handle_data(self, data: str):
+        if self._strip_depth > 0:
+            return  # skip content inside dangerous tags (e.g. <script>)
+        self.result.append(html.escape(data))
+
+    def handle_entityref(self, name: str):
+        if self._strip_depth == 0:
+            self.result.append(f"&{name};")
+
+    def handle_charref(self, name: str):
+        if self._strip_depth == 0:
+            self.result.append(f"&#{name};")
+
+
+def sanitize_gemini_html(raw_html: str) -> str:
+    """Strip dangerous tags/attributes from Gemini output before email injection."""
+    if not raw_html:
+        return ""
+    sanitizer = _HTMLSanitizer()
+    try:
+        sanitizer.feed(raw_html)
+    except Exception:
+        # If parsing fails entirely, escape everything as plain text
+        return html.escape(raw_html)
+    return "".join(sanitizer.result)
+
+
 _REQUEST_HEADERS = {
     "User-Agent": "CTI-Automation/1.0 (Security Feed Scanner)",
     "Accept": "text/html,application/xhtml+xml",
@@ -743,7 +827,8 @@ def main() -> None:
     if matched:
         prompt = build_prompt(matched)
         log.info("Sending %d articles to Gemini for analysis...", min(len(matched), 15))
-        briefing_html = analyze_with_gemini(prompt)
+        raw_briefing = analyze_with_gemini(prompt)
+        briefing_html = sanitize_gemini_html(raw_briefing)
 
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", briefing_html)
         send_email(

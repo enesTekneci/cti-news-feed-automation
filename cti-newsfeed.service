@@ -12,23 +12,55 @@ ExecStart=/opt/cti-project/venv/bin/python3 /opt/cti-project/cti_automation.py
 User=cti
 Group=cti
 
+# Log dosyalari icin guvenli umask (640: owner rw, group r, others -)
+UMask=0137
+
 # Hata durumunda 5 dk sonra tekrar dene (max 3 kez)
 Restart=on-failure
 RestartSec=300
 
-# Guvenlik sertlestirme
-NoNewPrivileges=true
+# ── Kaynak limitleri ─────────────────────────────────
+# Bellek: max 512MB (RSS feed parse + Gemini response icin yeterli)
+MemoryMax=512M
+MemorySwapMax=0
+# CPU: max %80 tek cekirdek
+CPUQuota=80%
+# Process/thread sayisi
+TasksMax=32
+# 10 dakika icinde bitmezse oldir (feed + gemini + mail ~1 dk suruyor)
+TimeoutStartSec=600
+
+# ── Dosya sistemi izolasyonu ─────────────────────────
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/cti-project/logs
 PrivateTmp=true
+PrivateDevices=true
+
+# ── Kernel korumalari ────────────────────────────────
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+
+# ── Ayricalik kisitlamalari ──────────────────────────
+NoNewPrivileges=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+
+# ── Ag kisitlamalari ─────────────────────────────────
+# Sadece IPv4, IPv6 ve Unix soketlerine izin ver
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── Process gorunurlugu ──────────────────────────────
+ProtectProc=invisible
+ProcSubset=pid
 
 # Ortam degiskenleri .env dosyasindan okunuyor (script icinde dotenv ile)
-# Ek olarak PATH tanimla
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 [Install]
