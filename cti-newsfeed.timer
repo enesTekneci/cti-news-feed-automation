@@ -1,0 +1,15 @@
+[Unit]
+Description=CTI News Feed — Gunluk zamanlayici (09:00)
+
+[Timer]
+# Her gun saat 09:00'da calistir
+OnCalendar=*-*-* 09:00:00
+
+# Sunucu kapali iken atlanan calistirmayi, acilinca otomatik yap
+Persistent=true
+
+# Birden fazla instance cakismasin
+AccuracySec=60
+
+[Install]
+WantedBy=timers.target

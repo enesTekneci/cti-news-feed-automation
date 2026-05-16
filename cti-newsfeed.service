@@ -1,0 +1,35 @@
+[Unit]
+Description=CTI News Feed Automation — Threat Briefing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+WorkingDirectory=/opt/cti-project
+ExecStart=/opt/cti-project/venv/bin/python3 /opt/cti-project/cti_automation.py
+
+User=cti
+Group=cti
+
+# Hata durumunda 5 dk sonra tekrar dene (max 3 kez)
+Restart=on-failure
+RestartSec=300
+
+# Guvenlik sertlestirme
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cti-project/logs
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# Ortam degiskenleri .env dosyasindan okunuyor (script icinde dotenv ile)
+# Ek olarak PATH tanimla
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

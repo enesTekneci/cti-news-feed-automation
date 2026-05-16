@@ -1,0 +1,21 @@
+# Credentials — ASLA commit edilmemeli
+.env
+.env.save
+.env.local
+.env.*.local
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
