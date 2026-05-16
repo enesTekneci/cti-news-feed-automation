@@ -202,6 +202,30 @@ HIGH_SIGNAL = [
     "patch tuesday", "emergency patch",
 ]
 
+# ── Önceliklendirme puanlama tablosu ────────────────
+# Kritik (3 puan): aktif sömürü, zero-day, RCE
+# Yüksek (2 puan): kritik açık, bypass, privilege escalation, PoC
+# Normal (1 puan): genel güvenlik sinyalleri
+_SIGNAL_SCORES: dict[str, int] = {
+    "actively exploited": 3, "exploited in the wild": 3,
+    "exploitation detected": 3, "zero-day": 3, "0-day": 3,
+    "remote code execution": 3, "rce": 3,
+    "critical vulnerability": 2, "critical flaw": 2,
+    "authentication bypass": 2, "privilege escalation": 2,
+    "arbitrary code execution": 2, "emergency patch": 2,
+    "proof of concept exploit": 2, "poc exploit": 2,
+}
+_DEFAULT_SIGNAL_SCORE = 1  # HIGH_SIGNAL'da olup tabloda olmayan keyword'ler
+
+
+def score_article(text: str) -> int:
+    """Makale metnine göre öncelik puanı hesapla (yüksek = daha kritik)."""
+    total = 0
+    for kw in HIGH_SIGNAL:
+        if kw in text:
+            total += _SIGNAL_SCORES.get(kw, _DEFAULT_SIGNAL_SCORE)
+    return total
+
 VENDOR_ALIASES = [
     {
         "vendor_key": "cisco",
@@ -652,8 +676,11 @@ def match_articles(articles: list[dict]) -> list[dict]:
             "pubDate": article.get("pubDate", ""),
             "matched_product": matched_product,
             "content": clean_content[:1000],
+            "priority_score": score_article(text),
         })
 
+    # Öncelik puanına göre sırala (en kritik haberler önce)
+    matches.sort(key=lambda x: x["priority_score"], reverse=True)
     return matches
 
 
@@ -772,6 +799,53 @@ NO_THREATS_CONTENT = """\
   <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki tarama yarın saat 09:00'da gerçekleştirilecektir.</p>
 </div>"""
 
+OVERFLOW_HEADER = """\
+<div style="margin-top:32px;padding-top:24px;border-top:2px solid #e0e0e0;">
+  <h3 style="color:#495057;font-family:Arial,sans-serif;">📋 Ek Eşleşen Haberler ({count} adet)</h3>
+  <p style="color:#6c757d;font-size:13px;margin-bottom:16px;">Aşağıdaki haberler envanterinizle eşleşti ancak detaylı AI analizi kapsamı dışında kaldı. Gerekirse manuel inceleme yapın.</p>
+  <table style="width:100%;border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">
+    <thead>
+      <tr style="background:#f8f9fa;">
+        <th style="text-align:left;padding:8px;border-bottom:1px solid #dee2e6;">Haber</th>
+        <th style="text-align:left;padding:8px;border-bottom:1px solid #dee2e6;">Ürün</th>
+      </tr>
+    </thead>
+    <tbody>
+"""
+
+OVERFLOW_ROW = """\
+      <tr>
+        <td style="padding:8px;border-bottom:1px solid #f0f0f0;"><a href="{link}" style="color:#0366d6;text-decoration:none;">{title}</a></td>
+        <td style="padding:8px;border-bottom:1px solid #f0f0f0;color:#555;">{product}</td>
+      </tr>
+"""
+
+OVERFLOW_FOOTER = """\
+    </tbody>
+  </table>
+</div>"""
+
+
+def build_overflow_html(overflow_articles: list[dict]) -> str:
+    """Gemini kapsamı dışında kalan makaleler için basit HTML tablo oluştur."""
+    if not overflow_articles:
+        return ""
+    rows = []
+    for a in overflow_articles:
+        title_escaped = html.escape(a.get("title", "Başlıksız"))
+        link = html.escape(a.get("link", "#"))
+        product = html.escape(a.get("matched_product", "—"))
+        rows.append(
+            OVERFLOW_ROW.replace("{title}", title_escaped)
+            .replace("{link}", link)
+            .replace("{product}", product)
+        )
+    return (
+        OVERFLOW_HEADER.replace("{count}", str(len(overflow_articles)))
+        + "".join(rows)
+        + OVERFLOW_FOOTER
+    )
+
 
 def send_email(subject: str, html_body: str) -> None:
     smtp_server = os.environ.get("SMTP_SERVER", "smtp.office365.com")
@@ -825,12 +899,23 @@ def main() -> None:
 
     # 4. Analyze & send
     if matched:
-        prompt = build_prompt(matched)
-        log.info("Sending %d articles to Gemini for analysis...", min(len(matched), 15))
+        # İlk 15 makale Gemini ile detaylı analiz edilir
+        top_matches = matched[:15]
+        overflow_matches = matched[15:]
+
+        prompt = build_prompt(top_matches)
+        log.info("Sending %d articles to Gemini for analysis...", len(top_matches))
+        if overflow_matches:
+            log.info("Overflow: %d additional articles will be listed without AI analysis.", len(overflow_matches))
+
         raw_briefing = analyze_with_gemini(prompt)
         briefing_html = sanitize_gemini_html(raw_briefing)
 
-        email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", briefing_html)
+        # Taşma bölümünü ekle (varsa)
+        overflow_html = build_overflow_html(overflow_matches)
+        full_content = briefing_html + overflow_html
+
+        email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", full_content)
         send_email(
             subject=f"🛡️ CTI Tehdit Brifing — {today}",
             html_body=email_body,
