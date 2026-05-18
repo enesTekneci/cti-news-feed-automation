@@ -29,6 +29,18 @@ apt-get update -qq
 apt-get install -y -qq python3 python3-venv python3-pip git > /dev/null
 echo "  ✓ python3, python3-venv, git kuruldu"
 
+# Python versiyon kontrolu (>= 3.10 gerekli)
+PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
+PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
+    echo ""
+    echo "  ✗ HATA: Python >= 3.10 gerekli (mevcut: $PY_VER)"
+    echo "  Ubuntu 22.04+ onerilir."
+    exit 1
+fi
+echo "  ✓ Python $PY_VER (>= 3.10 gereksinimi karsilandi)"
+
 # ── 2. Servis kullanicisi ────────────────────────────
 echo ""
 echo "[2/7] Servis kullanicisi olusturuluyor..."
@@ -122,6 +134,12 @@ echo ""
 if [ ! -s "${INSTALL_DIR}/.env" ] || grep -q "your-gemini-api-key-here" "${INSTALL_DIR}/.env" 2>/dev/null; then
     echo "  ⚠  ONEMLI: .env dosyasini duzenleyin:"
     echo "     sudo nano ${INSTALL_DIR}/.env"
+    echo ""
+fi
+CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "bilinmiyor")
+if [ "$CURRENT_TZ" = "Etc/UTC" ] || [ "$CURRENT_TZ" = "UTC" ]; then
+    echo "  ⚠  TIMEZONE: Sistem UTC'de — timer 09:00 UTC'de calisir."
+    echo "     Turkiye saati icin:  sudo timedatectl set-timezone Europe/Istanbul"
     echo ""
 fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

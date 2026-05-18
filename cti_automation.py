@@ -5,6 +5,7 @@ Fetches security RSS feeds, matches against product inventory,
 analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
 """
 
+import locale
 import os
 import re
 import html
@@ -26,6 +27,24 @@ from google import genai
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
+
+# ── Türkçe tarih (locale-bağımsız) ──────────────────
+_TR_MONTHS = {
+    1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan", 5: "Mayıs", 6: "Haziran",
+    7: "Temmuz", 8: "Ağustos", 9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık",
+}
+_TR_DAYS = {
+    0: "Pazartesi", 1: "Salı", 2: "Çarşamba", 3: "Perşembe",
+    4: "Cuma", 5: "Cumartesi", 6: "Pazar",
+}
+
+
+def turkish_date(dt: datetime | None = None) -> str:
+    """'17 Mayıs 2026, Cumartesi' formatında Türkçe tarih döndürür."""
+    if dt is None:
+        dt = datetime.now()
+    return f"{dt.day} {_TR_MONTHS[dt.month]} {dt.year}, {_TR_DAYS[dt.weekday()]}"
+
 
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -848,7 +867,7 @@ def build_overflow_html(overflow_articles: list[dict]) -> str:
 
 
 def send_email(subject: str, html_body: str) -> None:
-    smtp_server = os.environ.get("SMTP_SERVER", "smtp.office365.com")
+    smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     username = os.environ.get("SMTP_USERNAME", "")
     password = os.environ.get("SMTP_PASSWORD", "")
@@ -882,7 +901,7 @@ def send_email(subject: str, html_body: str) -> None:
 def main() -> None:
     log.info("=" * 60)
     log.info("CTI News Feed Automation — started")
-    today = datetime.now().strftime("%d %B %Y, %A")
+    today = turkish_date()
 
     # 1. Fetch all RSS feeds
     log.info("Fetching %d RSS feeds...", len(FEEDS))
