@@ -872,15 +872,17 @@ def send_email(subject: str, html_body: str) -> None:
     username = os.environ.get("SMTP_USERNAME", "")
     password = os.environ.get("SMTP_PASSWORD", "")
     email_from = os.environ.get("EMAIL_FROM", username)
-    email_to = os.environ.get("EMAIL_TO", "")
+    email_to_raw = os.environ.get("EMAIL_TO", "")
+    # Virgülle ayrılmış birden fazla alıcı desteklenir
+    recipients = [addr.strip() for addr in email_to_raw.split(",") if addr.strip()]
 
-    if not all([username, password, email_to]):
+    if not all([username, password, recipients]):
         raise RuntimeError("SMTP credentials or EMAIL_TO not configured")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = email_from
-    msg["To"] = email_to
+    msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
@@ -889,9 +891,9 @@ def send_email(subject: str, html_body: str) -> None:
         server.starttls(context=context)
         server.ehlo()
         server.login(username, password)
-        server.sendmail(email_from, [email_to], msg.as_string())
+        server.sendmail(email_from, recipients, msg.as_string())
 
-    log.info("Email sent to %s", email_to)
+    log.info("Email sent to %s", ", ".join(recipients))
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
