@@ -15,9 +15,11 @@ Group=cti
 # Log dosyalari icin guvenli umask (640: owner rw, group r, others -)
 UMask=0137
 
-# Hata durumunda 5 dk sonra tekrar dene (max 3 kez)
+# Hata durumunda 5 dk sonra tekrar dene (max 3 kez / saat)
 Restart=on-failure
 RestartSec=300
+StartLimitBurst=3
+StartLimitIntervalSec=3600
 
 # ── Kaynak limitleri ─────────────────────────────────
 # Bellek: max 512MB (RSS feed parse + Gemini response icin yeterli)

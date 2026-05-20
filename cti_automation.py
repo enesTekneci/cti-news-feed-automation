@@ -604,7 +604,7 @@ def fetch_article_body(url: str, timeout: int = 12) -> str:
         )
         resp.raise_for_status()
         raw = strip_html(resp.text)
-        return _WHITESPACE.sub(" ", raw).strip()[:5000]
+        return _WHITESPACE.sub(" ", raw).strip()[:3000]
     except Exception as exc:
         log.warning("Article fetch failed (%s): %s", url, exc)
         return ""
@@ -744,7 +744,7 @@ def match_articles(articles: list[dict]) -> list[dict]:
             "link": article.get("link", ""),
             "pubDate": article.get("pubDate", ""),
             "matched_product": matched_product,
-            "content": clean_content[:1000],
+            "content": clean_content[:500],
             "priority_score": score_article(text),
         })
 
