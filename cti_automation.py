@@ -604,7 +604,7 @@ def fetch_article_body(url: str, timeout: int = 12) -> str:
         )
         resp.raise_for_status()
         raw = strip_html(resp.text)
-        return _WHITESPACE.sub(" ", raw).strip()[:3000]
+        return _WHITESPACE.sub(" ", raw).strip()[:5000]
     except Exception as exc:
         log.warning("Article fetch failed (%s): %s", url, exc)
         return ""
@@ -781,10 +781,14 @@ def build_prompt(matched: list[dict]) -> str:
         full_body = article_bodies.get(link, "")
         rss_content = a.get("content", "")
 
-        # Hem RSS özetinden hem makale sayfasından versiyon çıkar
+        # Versiyon çıkarma: TAM METİN kullan (5000 char) → kalite korunsun
         combined_text = f"{rss_content} {full_body}"
         versions = extract_versions(combined_text)
         version_str = ", ".join(versions) if versions else "None detected in source"
+
+        # Gemini'ye gönderim: KISA BAĞLAM yeter (1500 char) → token tasarrufu
+        # Versiyonlar zaten "Detected Versions" alanında ayrıca veriliyor
+        body_for_gemini = full_body[:1500]
 
         parts.append(
             f"[{i}]\n"
@@ -793,7 +797,7 @@ def build_prompt(matched: list[dict]) -> str:
             f"Date: {a.get('pubDate', 'Unknown')}\n"
             f"Link: {link}\n"
             f"RSS Summary: {rss_content}\n"
-            f"Full Article Content: {full_body}\n"
+            f"Article Context: {body_for_gemini}\n"
             f"Detected Versions: {version_str}"
         )
     return "\n\n---\n\n".join(parts)
