@@ -76,11 +76,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("cti")
 
-# ── Gemini analiz limiti ─────────────────────────────────────────────────────
-# Gemini'ye tek seferde gönderilecek maksimum makale sayısı.
-# 250K günlük token bütçesi ile 50 makale ≈ 50K token (bütçenin %20'si).
-# Gerekirse bu değeri artırabilirsin — tek noktadan yönetilir.
-MAX_GEMINI_ARTICLES = 50
+# ── Gemini analiz limitleri ───────────────────────────────────────────────────
+# Tüm limitler tek noktadan yönetilir — gerekirse buradan ayarla.
+MAX_GEMINI_ARTICLES = 50       # Gemini'ye gönderilecek maks makale sayısı
+MAX_BODY_CHARS      = 10_000   # Makale sayfasından çekilecek maks metin (versiyon çıkarma)
+GEMINI_BODY_CHARS   = 3_000    # Gemini prompt'una gönderilecek makale bağlamı
+MAX_PROMPT_TOKENS   = 100_000  # Toplam prompt token üst sınırı (TPM güvenlik payı)
+# Token matematiği (50 makale × ~900 token/makale ≈ 45K token):
+#   Günlük bütçe: 250K → %18 kullanım. TPM: tek istek/gün, aşım riski yok.
+#   Makale sayısı artarsa body_chars dinamik olarak kısılır (build_prompt içinde).
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  INVENTORY
@@ -520,7 +524,7 @@ def extract_versions(text: str) -> list[str]:
     """Metinden versiyon numaralarını/aralıklarını çıkar.
 
     Gemini'ye "Detected Versions" alanı olarak ayrı bir liste verilir,
-    böylece model versiyonları kaçırmaz. Tam article body (5000 char)
+    böylece model versiyonları kaçırmaz. Tam article body (MAX_BODY_CHARS)
     üzerinden çalışır.
     """
     found: list[str] = []
@@ -652,8 +656,8 @@ _SSRF_BLOCKED = re.compile(
 def fetch_article_body(url: str, timeout: int = 12) -> str:
     """Makale URL'sine gidip sayfa içeriğini düz metin olarak döndürür.
 
-    Tam sayfa içeriği (max 5000 char) versiyon çıkarma için kullanılır.
-    Gemini'ye sadece ilk 1500 char'ı gönderilir (token tasarrufu).
+    Tam sayfa içeriği (MAX_BODY_CHARS) versiyon çıkarma için kullanılır.
+    Gemini'ye daha kısa bağlam gönderilir (GEMINI_BODY_CHARS — build_prompt içinde).
     """
     if not url or not url.startswith("http"):
         return ""
@@ -671,7 +675,7 @@ def fetch_article_body(url: str, timeout: int = 12) -> str:
         )
         resp.raise_for_status()
         raw = strip_html(resp.text)
-        return _WHITESPACE.sub(" ", raw).strip()[:5000]
+        return _WHITESPACE.sub(" ", raw).strip()[:MAX_BODY_CHARS]
     except Exception as exc:
         # Bir makale çekilemese bile diğerleri devam etmeli — sessizce logla
         log.warning("Article fetch failed (%s): %s", url, exc)
@@ -871,6 +875,16 @@ def build_prompt(matched: list[dict]) -> str:
     """En kritik makaleler için Gemini prompt'unu oluştur (limit: MAX_GEMINI_ARTICLES)."""
     capped = matched[:MAX_GEMINI_ARTICLES]  # Sabit ile kontrol — tek noktadan yönetilir
 
+    # ── Dinamik body limiti: makale sayısına göre TPM güvenliği ──────────
+    # Her makalenin overhead'ı ~200 token (Product, Title, Date, Link, RSS, Versions).
+    # Kalan bütçeyi body_chars olarak eşit dağıt. Az makale = daha derin bağlam.
+    _OVERHEAD_PER_ARTICLE = 200  # sabit alanların tahmini token maliyeti
+    _CHARS_PER_TOKEN = 4         # ortalama (İngilizce/Türkçe karışık kaynak)
+    available_tokens = MAX_PROMPT_TOKENS - (_OVERHEAD_PER_ARTICLE * len(capped))
+    body_limit = min(GEMINI_BODY_CHARS, max(500, int(available_tokens * _CHARS_PER_TOKEN / len(capped))))
+    log.info("Dynamic body limit: %d chars/article (articles=%d, budget=%dK tokens)",
+             body_limit, len(capped), MAX_PROMPT_TOKENS // 1000)
+
     # Makale sayfalarını paralel çek (8 worker — feed'lerden hızlı)
     log.info("Fetching %d article pages for version details...", len(capped))
     article_bodies: dict[str, str] = {}
@@ -893,15 +907,15 @@ def build_prompt(matched: list[dict]) -> str:
         full_body = article_bodies.get(link, "")
         rss_content = a.get("content", "")
 
-        # Versiyon çıkarma: TAM METİN kullan (5000 char) → kalite korunsun
+        # Versiyon çıkarma: TAM METİN kullan (MAX_BODY_CHARS) → kalite korunsun
         # Bazı advisory'lerde versiyon bilgisi metnin ilerleyen kısımlarında
         combined_text = f"{rss_content} {full_body}"
         versions = extract_versions(combined_text)
         version_str = ", ".join(versions) if versions else "None detected in source"
 
-        # Gemini'ye gönderim: KISA BAĞLAM yeter (1500 char) → token tasarrufu
+        # Gemini'ye gönderim: body_limit dinamik olarak ayarlanır (TPM aşımını önler)
         # Versiyonlar zaten "Detected Versions" alanında ayrıca veriliyor
-        body_for_gemini = full_body[:1500]
+        body_for_gemini = full_body[:body_limit]
 
         # Her makaleyi numarayla etiketle ve standart alanlarla biçimle
         parts.append(
