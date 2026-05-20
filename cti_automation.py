@@ -8,7 +8,7 @@ analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
   1. 66 RSS feed'ini paralel olarak çek
   2. Son 24 saatteki makaleleri filtrele
   3. Envanterdeki ürünlerle eşleşenleri bul
-  4. En kritik 15 makaleyi Gemini'ye gönder, derin analiz al
+  4. En kritik makaleleri Gemini'ye gönder (limit: MAX_GEMINI_ARTICLES), derin analiz al
   5. HTML e-posta olarak SMTP üzerinden gönder
 """
 
@@ -75,6 +75,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("cti")
+
+# ── Gemini analiz limiti ─────────────────────────────────────────────────────
+# Gemini'ye tek seferde gönderilecek maksimum makale sayısı.
+# 250K günlük token bütçesi ile 50 makale ≈ 50K token (bütçenin %20'si).
+# Gerekirse bu değeri artırabilirsin — tek noktadan yönetilir.
+MAX_GEMINI_ARTICLES = 50
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  INVENTORY
@@ -310,8 +316,8 @@ _DEFAULT_SIGNAL_SCORE = 1  # HIGH_SIGNAL'da olup tabloda olmayan keyword'ler
 def score_article(text: str) -> int:
     """Makale metnine göre öncelik puanı hesapla (yüksek = daha kritik).
 
-    Bu puan 15 makale limitinde önceliği belirler: en kritik 15 makale
-    Gemini'ye gider, geri kalanı taşma tablosunda gösterilir.
+    Bu puan MAX_GEMINI_ARTICLES limitinde önceliği belirler: en kritik
+    makaleler Gemini'ye gider, geri kalanı taşma tablosunda gösterilir.
     """
     total = 0
     for kw in HIGH_SIGNAL:
@@ -849,7 +855,7 @@ def match_articles(articles: list[dict]) -> list[dict]:
             "priority_score": score_article(text),
         })
 
-    # Öncelik puanına göre sırala (en kritik haberler önce, ilk 15'i Gemini'ye gider)
+    # Öncelik puanına göre sırala (en kritik haberler önce, ilk MAX_GEMINI_ARTICLES tanesi Gemini'ye gider)
     matches.sort(key=lambda x: x["priority_score"], reverse=True)
     return matches
 
@@ -862,8 +868,8 @@ def match_articles(articles: list[dict]) -> list[dict]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def build_prompt(matched: list[dict]) -> str:
-    """En kritik 15 makale için Gemini prompt'unu oluştur."""
-    capped = matched[:15]  # Maliyet kontrolü: maks 15 makale
+    """En kritik makaleler için Gemini prompt'unu oluştur (limit: MAX_GEMINI_ARTICLES)."""
+    capped = matched[:MAX_GEMINI_ARTICLES]  # Sabit ile kontrol — tek noktadan yönetilir
 
     # Makale sayfalarını paralel çek (8 worker — feed'lerden hızlı)
     log.info("Fetching %d article pages for version details...", len(capped))
@@ -994,7 +1000,7 @@ NO_THREATS_CONTENT = """\
   <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki tarama yarın saat 09:00'da gerçekleştirilecektir.</p>
 </div>"""
 
-# Taşma tablosu — 15'in üzerindeki eşleşmeler için (Gemini analizi yok, sadece liste)
+# Taşma tablosu — MAX_GEMINI_ARTICLES üzerindeki eşleşmeler için (Gemini analizi yok, sadece liste)
 OVERFLOW_HEADER = """\
 <div style="margin-top:32px;padding-top:24px;border-top:2px solid #e0e0e0;">
   <h3 style="color:#495057;font-family:Arial,sans-serif;">📋 Ek Eşleşen Haberler ({count} adet)</h3>
@@ -1113,9 +1119,9 @@ def main() -> None:
 
     # 4. Eşleşme varsa Gemini'ye gönder ve e-posta at
     if matched:
-        # İlk 15 makale Gemini ile detaylı analiz edilir (öncelik puanına göre sıralı)
-        top_matches = matched[:15]
-        overflow_matches = matched[15:]  # Kalanı listede gösterilir
+        # Öncelik puanına göre sıralı — ilk MAX_GEMINI_ARTICLES makale Gemini ile analiz edilir
+        top_matches = matched[:MAX_GEMINI_ARTICLES]
+        overflow_matches = matched[MAX_GEMINI_ARTICLES:]  # Kalanı listede gösterilir
 
         prompt = build_prompt(top_matches)
         log.info("Sending %d articles to Gemini for analysis...", len(top_matches))
@@ -1126,7 +1132,7 @@ def main() -> None:
         raw_briefing = analyze_with_gemini(prompt)
         briefing_html = sanitize_gemini_html(raw_briefing)
 
-        # Taşma bölümünü ekle (15'in üzerindeki makaleler için)
+        # Taşma bölümünü ekle (MAX_GEMINI_ARTICLES üzerindeki makaleler için)
         overflow_html = build_overflow_html(overflow_matches)
         full_content = briefing_html + overflow_html
 
