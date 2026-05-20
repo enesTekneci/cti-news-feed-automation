@@ -247,92 +247,95 @@ def score_article(text: str) -> int:
 
 VENDOR_ALIASES = [
     {
+        # Cisco router/switch modelleri envanterde — OS ve platform alias'ları
         "vendor_key": "cisco",
         "aliases": [
             "cisco ios", "cisco nx-os", "cisco asa", "cisco ftd",
-            "cisco anyconnect", "cisco catalyst", "cisco nexus",
-            "cisco isr", "cisco router", "cisco switch", "cisco ise",
-            "cisco webex", "cisco secure",
+            "cisco catalyst", "cisco nexus", "cisco isr",
         ],
     },
     {
-        "vendor_key": "fortinet",
+        # FortiOS/FortiGate envanterde — "forti" prefix ile eşleşme
+        "vendor_key": "forti",
         "aliases": [
             "fortinet", "fortios", "fortigate", "fortimanager",
             "forticlient", "fortiauthenticator", "fortianalyzer",
-            "fortisandbox",
         ],
     },
     {
+        # ESXi/vSphere/vCenter envanterde — VMware platform alias'ları
         "vendor_key": "vmware",
         "aliases": [
             "vmware", "esxi", "vsphere", "vcenter", "vrealize",
-            "vmware workstation", "vmware fusion",
         ],
     },
     {
+        # Big-IP LTM/ASM/AWAF envanterde — F5 alternatif adları
         "vendor_key": "big-ip",
         "aliases": [
-            "big-ip", "f5 networks", "f5 big-ip", "f5 ltm", "f5 asm",
-            "f5 waf",
+            "big-ip", "f5 big-ip", "f5 ltm", "f5 asm", "f5 waf",
         ],
     },
     {
+        # SAP Netweaver/Web Dispatcher envanterde — SAP platform alias'ları
         "vendor_key": "sap",
         "aliases": [
-            "sap netweaver", "sap hana", "sap abap", "sap s/4",
-            "sap solution manager", "sap web dispatcher",
+            "sap netweaver", "sap abap", "sap solution manager",
+            "sap web dispatcher",
         ],
     },
     {
+        # Exchange/IIS/Teams/SharePoint envanterde — Microsoft alias'ları
         "vendor_key": "microsoft",
         "aliases": [
             "windows server", "microsoft exchange", "sharepoint",
             "office 365", "microsoft 365", "microsoft iis",
-            "active directory", "azure ad", "entra id", "microsoft teams",
-            "hyper-v", "ms exchange",
+            "active directory", "microsoft teams", "ms exchange",
         ],
     },
     {
+        # PAN-OS envanterde — Palo Alto alias'ları
         "vendor_key": "palo alto",
         "aliases": [
-            "pan-os", "palo alto", "panorama", "globalprotect",
-            "prisma access",
+            "pan-os", "palo alto networks",
         ],
     },
     {
+        # SolarWinds Platform envanterde — Orion alias'ları
         "vendor_key": "solarwinds",
         "aliases": ["solarwinds", "orion platform", "solarwinds orion"],
     },
     {
+        # Veeam Backup And Replication envanterde
         "vendor_key": "veeam",
-        "aliases": ["veeam backup", "veeam replication", "veeam one"],
+        "aliases": ["veeam backup", "veeam replication"],
     },
     {
+        # WordPress/Yoast/WP Cache envanterde — sadece core alias'lar
         "vendor_key": "wordpress",
         "aliases": [
-            "wordpress", "wp-admin", "elementor", "woocommerce",
-            "wordpress plugin",
+            "wordpress",
         ],
     },
     {
+        # Apache Tomcat / HTTP Server envanterde
         "vendor_key": "apache",
         "aliases": [
             "apache tomcat", "apache httpd", "apache http server",
-            "apache struts",
         ],
     },
     {
+        # Citrix Workspace / Netscaler envanterde
         "vendor_key": "citrix",
         "aliases": [
             "citrix", "netscaler", "citrix adc", "citrix workspace",
-            "citrix virtual apps",
         ],
     },
     {
+        # CyberArk Identity/Viewfinity/EPM envanterde
         "vendor_key": "cyberark",
         "aliases": [
-            "cyberark", "privileged access manager", "conjur",
+            "cyberark", "privileged access manager",
         ],
     },
 ]
@@ -681,7 +684,8 @@ def match_articles(articles: list[dict]) -> list[dict]:
 
         if not matched_product:
             for alias in active_aliases:
-                if alias in text:
+                escaped_alias = re.escape(alias)
+                if re.search(rf"(?<![\w-]){escaped_alias}(?![\w-])", text, re.IGNORECASE):
                     matched_product = alias
                     break
 
@@ -764,7 +768,7 @@ def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=genai.types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,

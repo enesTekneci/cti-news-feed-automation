@@ -2,8 +2,8 @@
 Description=CTI News Feed — Gunluk zamanlayici (09:00)
 
 [Timer]
-# Her gun saat 09:00'da calistir
-OnCalendar=*-*-* 09:00:00
+# Her gun Istanbul saatiyle 09:00'da calistir (sunucu UTC ise 06:00 UTC)
+OnCalendar=*-*-* 06:00:00
 
 # Sunucu kapali iken atlanan calistirmayi, acilinca otomatik yap
 Persistent=true
