@@ -1,69 +1,101 @@
 [Unit]
+# Systemd'de gorulecek aciklama (systemctl status komutunda gosterilir)
 Description=CTI News Feed Automation — Threat Briefing
+
+# Internet baglantisi hazir olana kadar bekle (Gemini API ve SMTP icin)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+# oneshot = bir kez calisir ve cikar (daemon degil, gunluk gorev)
 Type=oneshot
 
+# Script bu klasorde calisacak (log dosyalari icin onemli)
 WorkingDirectory=/opt/cti-project
+
+# Python'u venv icinden cagir (sistem Python'unu kullanma)
 ExecStart=/opt/cti-project/venv/bin/python3 /opt/cti-project/cti_automation.py
 
+# Yetkisiz sistem kullanicisi (root degil) — guvenlik icin sart
 User=cti
 Group=cti
 
-# Log dosyalari icin guvenli umask (640: owner rw, group r, others -)
+# Yeni olusturulan log dosyalarinin izni 640 olur (others okuyamaz)
 UMask=0137
 
-# Hata durumunda 5 dk sonra tekrar dene (max 3 kez / saat)
+# ── Yeniden deneme politikasi ────────────────────────
+# Hata cikarsa 5 dk bekle, tekrar dene (max saatte 3 deneme)
 Restart=on-failure
 RestartSec=300
 StartLimitBurst=3
 StartLimitIntervalSec=3600
 
 # ── Kaynak limitleri ─────────────────────────────────
-# Bellek: max 512MB (RSS feed parse + Gemini response icin yeterli)
+# Maks RAM kullanimi (RSS parse + Gemini + mail icin yeterli)
 MemoryMax=512M
+# Swap kullanma — surec hizli kalsin
 MemorySwapMax=0
-# CPU: max %80 tek cekirdek
+# Tek cekirdek %80'i (sunucuyu zorlamasin)
 CPUQuota=80%
-# Process/thread sayisi
+# Process/thread sayisi limiti
 TasksMax=32
-# 10 dakika icinde bitmezse oldir (feed + gemini + mail ~1 dk suruyor)
+# 10 dakikada bitmezse durdur (normalde ~1 dk surer)
 TimeoutStartSec=600
 
 # ── Dosya sistemi izolasyonu ─────────────────────────
+# Tum dosya sistemini sadece okunabilir yap
 ProtectSystem=strict
+# /home klasorlerini gizle (script home'a erisemez)
 ProtectHome=true
+# Sadece bu klasore yazabilir (log dosyalari icin)
 ReadWritePaths=/opt/cti-project/logs
+# Her calistirmada ayri /tmp ortami (paylasimli /tmp riskini onler)
 PrivateTmp=true
+# /dev/* cihaz dosyalarina erisimi engelle
 PrivateDevices=true
 
 # ── Kernel korumalari ────────────────────────────────
+# /proc/sys ve /sys icindeki kernel parametrelerini degistiremez
 ProtectKernelTunables=true
+# Yeni kernel modulu yukleyemez
 ProtectKernelModules=true
+# Kernel loglarini okuyamaz (dmesg engellenir)
 ProtectKernelLogs=true
+# cgroup'lari degistiremez (kaynak limit kacirma engellenir)
 ProtectControlGroups=true
+# Sistem saatini degistiremez
 ProtectClock=true
+# Hostname degistiremez
 ProtectHostname=true
+# Personality syscall'i kisitla (ASLR bypass engellenir)
 LockPersonality=true
 
 # ── Ayricalik kisitlamalari ──────────────────────────
+# setuid binary calistirsa bile yetki yukseltemez
 NoNewPrivileges=true
+# SUID/SGID bit'li dosya olusturamaz
 RestrictSUIDSGID=true
+# Real-time scheduling kullanamaz
 RestrictRealtime=true
+# Yeni namespace olusturamaz (container kacis koruması)
 RestrictNamespaces=true
 
 # ── Ag kisitlamalari ─────────────────────────────────
 # Sadece IPv4, IPv6 ve Unix soketlerine izin ver
+# (AF_PACKET, AF_NETLINK gibi tehlikeli soketleri engelle)
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 # ── Process gorunurlugu ──────────────────────────────
+# Baska kullanicilarin processlerini goremez
 ProtectProc=invisible
+# /proc'ta sadece process bilgilerini gor (sistem bilgisi gizli)
 ProcSubset=pid
 
-# Ortam degiskenleri .env dosyasindan okunuyor (script icinde dotenv ile)
+# ── Ortam degiskenleri ───────────────────────────────
+# Gemini API key vb. .env dosyasindan okuniyor (script icinde dotenv ile)
+# Sadece PATH lazim
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 
 [Install]
+# Multi-user mode'da etkin olsun (normal sistem baslangici)
 WantedBy=multi-user.target

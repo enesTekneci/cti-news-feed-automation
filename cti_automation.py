@@ -3,29 +3,39 @@
 CTI News Feed Automation
 Fetches security RSS feeds, matches against product inventory,
 analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
+
+Çalışma akışı:
+  1. 66 RSS feed'ini paralel olarak çek
+  2. Son 24 saatteki makaleleri filtrele
+  3. Envanterdeki ürünlerle eşleşenleri bul
+  4. En kritik 15 makaleyi Gemini'ye gönder, derin analiz al
+  5. HTML e-posta olarak SMTP üzerinden gönder
 """
 
+# Standart kütüphane modülleri
 import locale
 import os
 import re
-import html
+import html                          # HTML escape (XSS koruması için)
 import logging
-import logging.handlers
-import smtplib
-import ssl
-import time
+import logging.handlers              # RotatingFileHandler (log boyut sınırı)
+import smtplib                       # SMTP ile e-posta gönderme
+import ssl                           # STARTTLS bağlantısı
+import time                          # exponential backoff retry
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from html.parser import HTMLParser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser   # Gemini HTML çıktısını sanitize
+from concurrent.futures import ThreadPoolExecutor, as_completed  # Paralel RSS çekme
 from pathlib import Path
 
-import feedparser
-import requests
-from google import genai
-from dotenv import load_dotenv
+# Üçüncü parti paketler
+import feedparser                    # RSS/Atom/JSON Feed parser
+import requests                      # HTTP istekleri (article fetch)
+from google import genai             # Gemini AI SDK
+from dotenv import load_dotenv       # .env dosyasından credentials oku
 
+# .env dosyasını yükle — API key'ler ve SMTP bilgileri buradan gelir
 load_dotenv(Path(__file__).parent / ".env")
 
 # ── Türkçe tarih (locale-bağımsız) ──────────────────
@@ -47,25 +57,30 @@ def turkish_date(dt: datetime | None = None) -> str:
 
 
 LOG_DIR = Path(__file__).parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(exist_ok=True)  # logs/ klasörü yoksa oluştur
 
+# Loglama: hem dosyaya hem konsola yaz
+# RotatingFileHandler: dosya 5MB'a ulaşınca yenisi açılır, en fazla 3 backup tutulur
+# Bu sayede log dosyası diski doldurmaz (max 15MB)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        # Max 5 MB per file, keep 3 backups (5MB × 3 = 15MB max disk)
         logging.handlers.RotatingFileHandler(
             LOG_DIR / "cti_automation.log",
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=3,              # 3 eski log tut (cti_automation.log.1, .2, .3)
         ),
-        logging.StreamHandler(),
+        logging.StreamHandler(),        # systemd journal'a da yazsın
     ],
 )
 log = logging.getLogger("cti")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  INVENTORY
+#  Ortamda kullanılan ürünlerin listesi (~190 ürün).
+#  match_articles() bu listede bulunan ürün adlarını makale içinde arar.
+#  Yeni ürün eklemek için aşağıya yazman yeterli.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 INVENTORY = [
@@ -172,6 +187,10 @@ INVENTORY = [
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  RSS FEEDS
+#  66 güvenlik haber/advisory kaynağı (her biri 10 worker ile paralel çekilir).
+#  Tier 1: Birincil CTI kaynakları (CERT, vendor PSIRT, ana medya)
+#  Tier 2: Destekleyici kaynaklar (haber siteleri, blog)
+#  Tier 3: Ek kaynaklar (USOM, ZDI, ransomware tracker vb.)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 FEEDS = [
@@ -248,6 +267,11 @@ FEEDS = [
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HIGH-SIGNAL KEYWORDS & VENDOR ALIASES
+#  HIGH_SIGNAL: Bir makalenin güvenlik haberi olarak değerlendirilmesi için
+#               içermesi GEREKEN kelime listesi (en az 1 tane).
+#               Gürültüyü azaltır — sadece kritik güvenlik haberleri geçer.
+#  VENDOR_ALIASES: Ürünün alternatif/kısa adları (örn. "Apache HTTP Server"
+#                  ← "apache httpd"). Envanterde olmayan alias'lar atlandı.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 HIGH_SIGNAL = [
@@ -284,13 +308,21 @@ _DEFAULT_SIGNAL_SCORE = 1  # HIGH_SIGNAL'da olup tabloda olmayan keyword'ler
 
 
 def score_article(text: str) -> int:
-    """Makale metnine göre öncelik puanı hesapla (yüksek = daha kritik)."""
+    """Makale metnine göre öncelik puanı hesapla (yüksek = daha kritik).
+
+    Bu puan 15 makale limitinde önceliği belirler: en kritik 15 makale
+    Gemini'ye gider, geri kalanı taşma tablosunda gösterilir.
+    """
     total = 0
     for kw in HIGH_SIGNAL:
         if kw in text:
             total += _SIGNAL_SCORES.get(kw, _DEFAULT_SIGNAL_SCORE)
     return total
 
+# Alias matching iki aşamalı çalışır:
+# 1) vendor_key envanter ürün adında geçiyor mu? (örn. "cisco" → "cisco 1921")
+# 2) Geçiyorsa o vendor'un alias'ları aktif olur
+# Böylece kullanmadığın vendor'un alias'ları false positive üretmez.
 VENDOR_ALIASES = [
     {
         # Cisco router/switch modelleri envanterde — OS ve platform alias'ları
@@ -388,6 +420,9 @@ VENDOR_ALIASES = [
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GEMINI SYSTEM PROMPT
+#  Gemini'ye verilen rol tanımı ve çıktı şablonu.
+#  Türkçe HTML brifing üretir: tarih, kaynak, etkilenen/yamalı sürümler,
+#  özet, aksiyon, öneri. Severite (YÜKSEK/ORTA/DÜŞÜK) renkli işaretlenir.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SYSTEM_PROMPT = """Sen kıdemli bir Siber Tehdit İstihbaratı (CTI) Analistsin ve bir güvenlik operasyonları ekibine doğrudan danışmanlık yapıyorsun.
@@ -432,17 +467,21 @@ KURALLAR:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HELPERS
+#  Metin temizleme, versiyon çıkarma, HTML işleme yardımcıları
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# Pre-compiled regex'ler (her kullanımda yeniden compile etmemek için)
 _HTML_TAG = re.compile(r"<[^>]*>")
 _WHITESPACE = re.compile(r"\s+")
 
 
 def strip_html(html: str) -> str:
+    """HTML tag'lerini çıkar ve fazla boşlukları tek boşluğa indirge."""
     return _WHITESPACE.sub(" ", _HTML_TAG.sub(" ", html or "")).strip()
 
 
 def norm(s: str) -> str:
+    """Metni normalize et: küçük harf + boşlukları tekleştir (eşleştirme için)."""
     return _WHITESPACE.sub(" ", (s or "").lower()).strip()
 
 
@@ -472,18 +511,27 @@ _FALSE_VERSION_RE = re.compile(
 
 
 def extract_versions(text: str) -> list[str]:
-    """Metinden versiyon numaralarını/aralıklarını çıkar."""
+    """Metinden versiyon numaralarını/aralıklarını çıkar.
+
+    Gemini'ye "Detected Versions" alanı olarak ayrı bir liste verilir,
+    böylece model versiyonları kaçırmaz. Tam article body (5000 char)
+    üzerinden çalışır.
+    """
     found: list[str] = []
     for m in _VERSION_RE.finditer(text):
+        # Aralık eşleşmesi: "7.0.0 through 7.4.2" → "7.0.0 – 7.4.2"
         if m.group(2) and m.group(3):
             token = f"{m.group(2)} – {m.group(3)}"
+        # "Before/prior to" eşleşmesi: "before 9.0.98" → "< 9.0.98"
         elif m.group(4):
             token = f"< {m.group(4)}"
+        # Bağımsız versiyon: "PHP 8.3.12" → "8.3.12"
         else:
             token = m.group(1) or m.group(5) or ""
         token = token.strip(" .,;)")
         if not token or len(token) < 3:
             continue
+        # Tarihler/CVE numaraları gibi yanlış pozitifleri at
         if _FALSE_VERSION_RE.match(token):
             continue
         if token not in found:
@@ -493,16 +541,21 @@ def extract_versions(text: str) -> list[str]:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  HTML SANITIZATION (Gemini output → email injection protection)
+#  Gemini'nin ürettiği HTML doğrudan e-postaya enjekte edildiğinden, XSS
+#  ve enjeksiyon riskine karşı whitelist tabanlı temizleyici şart.
+#  Sadece izin verilen tag/attribute'lar kalır, gerisi atılır.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# E-postada görünmesine izin verilen HTML tag'leri
 _ALLOWED_TAGS = frozenset([
     "div", "p", "h1", "h2", "h3", "h4", "strong", "em", "a", "br",
     "span", "ul", "ol", "li", "table", "tr", "td", "th", "thead", "tbody",
 ])
 
+# İzin verilen attribute'lar (style: inline CSS, href: linkler için)
 _ALLOWED_ATTRS = frozenset(["style", "href", "class"])
 
-# Dangerous patterns in attribute values
+# Attribute değerinde tespit edilirse o attribute atılır (XSS vektörleri)
 _DANGEROUS_ATTR_VALUE = re.compile(
     r"javascript\s*:|data\s*:|vbscript\s*:|expression\s*\(|url\s*\(",
     re.IGNORECASE,
@@ -573,12 +626,14 @@ def sanitize_gemini_html(raw_html: str) -> str:
     return "".join(sanitizer.result)
 
 
+# HTTP istek başlıkları — User-Agent kimliği ve kabul edilen MIME türleri
 _REQUEST_HEADERS = {
     "User-Agent": "CTI-Automation/1.0 (Security Feed Scanner)",
     "Accept": "text/html,application/xhtml+xml",
 }
 
 # SSRF koruması: iç ağ adreslerine istek yapılmasını engelle
+# (saldırgan RSS feed'inde 127.0.0.1, AWS metadata URL'si vb. enjekte ederse engeller)
 _SSRF_BLOCKED = re.compile(
     r"^https?://("
     r"localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\."
@@ -589,13 +644,19 @@ _SSRF_BLOCKED = re.compile(
 
 
 def fetch_article_body(url: str, timeout: int = 12) -> str:
-    """Makale URL'sine gidip sayfa içeriğini düz metin olarak döndürür."""
+    """Makale URL'sine gidip sayfa içeriğini düz metin olarak döndürür.
+
+    Tam sayfa içeriği (max 5000 char) versiyon çıkarma için kullanılır.
+    Gemini'ye sadece ilk 1500 char'ı gönderilir (token tasarrufu).
+    """
     if not url or not url.startswith("http"):
         return ""
+    # SSRF koruması
     if _SSRF_BLOCKED.search(url):
         log.warning("SSRF blocked: %s", url)
         return ""
     try:
+        # max_redirects=3: sonsuz redirect loop'unu önler
         session = requests.Session()
         session.max_redirects = 3
         resp = session.get(
@@ -606,18 +667,24 @@ def fetch_article_body(url: str, timeout: int = 12) -> str:
         raw = strip_html(resp.text)
         return _WHITESPACE.sub(" ", raw).strip()[:5000]
     except Exception as exc:
+        # Bir makale çekilemese bile diğerleri devam etmeli — sessizce logla
         log.warning("Article fetch failed (%s): %s", url, exc)
         return ""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  RSS FETCHING
+#  feedparser RSS, Atom ve JSON Feed formatlarını destekler.
+#  Her feed paralel çekilir (10 worker thread), tek bir yavaş feed
+#  toplam süreyi yavaşlatmaz.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def fetch_feed(name: str, url: str) -> list[dict]:
+    """Tek bir RSS feed'i çek ve makale listesi olarak döndür."""
     try:
         feed = feedparser.parse(url)
         articles = []
+        # Her entry'den standart alanları çıkar (RSS/Atom uyumluluğu için getattr)
         for entry in feed.entries:
             articles.append({
                 "title": getattr(entry, "title", ""),
@@ -625,6 +692,7 @@ def fetch_feed(name: str, url: str) -> list[dict]:
                 "pubDate": getattr(entry, "published", getattr(entry, "updated", "")),
                 "isoDate": getattr(entry, "published", getattr(entry, "updated", "")),
                 "description": getattr(entry, "summary", ""),
+                # content:encoded varsa kullan (Atom'da daha zengin içerik)
                 "content_encoded": (
                     entry.content[0].value if hasattr(entry, "content") and entry.content else ""
                 ),
@@ -632,14 +700,18 @@ def fetch_feed(name: str, url: str) -> list[dict]:
             })
         return articles
     except Exception as e:
+        # Bir feed çökse de diğerleri devam eder
         log.warning("Feed %s failed: %s", name, e)
         return []
 
 
 def fetch_all_feeds() -> list[dict]:
+    """Tüm FEEDS listesini 10 paralel worker ile çek, hepsini birleştir."""
     all_articles = []
     with ThreadPoolExecutor(max_workers=10) as pool:
+        # Her feed için bir future oluştur
         futures = {pool.submit(fetch_feed, name, url): name for name, url in FEEDS}
+        # Tamamlananları sırayla işle (sırasız geliyor, as_completed ile)
         for future in as_completed(futures):
             name = futures[future]
             try:
@@ -653,19 +725,30 @@ def fetch_all_feeds() -> list[dict]:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  FILTERING & MATCHING
+#  3 aşamalı süzgeç:
+#    1. Son 24 saat filtresi
+#    2. HIGH_SIGNAL kelime kontrolü (güvenlik haberi mi?)
+#    3. Envanter eşleşmesi (önce exact, sonra alias)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def parse_date(date_str: str) -> datetime | None:
+    """RSS'den gelen farklı tarih formatlarını datetime'a çevir.
+
+    Çoklu format dener: RFC 822 (RSS), ISO 8601 (Atom), basit tarih vb.
+    Hiçbiri uymazsa Python'un email.utils.parsedate_to_datetime'ını dener.
+    Timezone yoksa UTC varsayar.
+    """
     if not date_str:
         return None
+    # Yaygın tarih formatlarını sırayla dene
     for fmt in (
-        "%a, %d %b %Y %H:%M:%S %z",
-        "%a, %d %b %Y %H:%M:%S %Z",
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%S.%f%z",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
+        "%a, %d %b %Y %H:%M:%S %z",      # RSS: "Mon, 17 May 2026 12:00:00 +0000"
+        "%a, %d %b %Y %H:%M:%S %Z",      # RSS: "Mon, 17 May 2026 12:00:00 GMT"
+        "%Y-%m-%dT%H:%M:%S%z",           # Atom: "2026-05-17T12:00:00+00:00"
+        "%Y-%m-%dT%H:%M:%S.%f%z",        # Atom microsecond ile
+        "%Y-%m-%dT%H:%M:%SZ",            # ISO UTC suffix
+        "%Y-%m-%d %H:%M:%S",             # SQL benzeri
+        "%Y-%m-%d",                      # Sadece tarih
     ):
         try:
             dt = datetime.strptime(date_str.strip(), fmt)
@@ -674,6 +757,7 @@ def parse_date(date_str: str) -> datetime | None:
             return dt
         except ValueError:
             continue
+    # Son çare: Python'un email tarih parser'ı (esnek)
     try:
         import email.utils
         parsed = email.utils.parsedate_to_datetime(date_str)
@@ -685,6 +769,7 @@ def parse_date(date_str: str) -> datetime | None:
 
 
 def filter_recent(articles: list[dict], hours: int = 24) -> list[dict]:
+    """Sadece son N saatteki makaleleri tut (varsayılan 24 saat)."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     recent = []
     for a in articles:
@@ -695,14 +780,24 @@ def filter_recent(articles: list[dict], hours: int = 24) -> list[dict]:
 
 
 def match_articles(articles: list[dict]) -> list[dict]:
+    """Makaleleri envantere göre eşleştir, puanla ve sırala.
+
+    Akış:
+      1. Duplicate başlıkları at (aynı haber farklı feed'lerden gelmiş olabilir)
+      2. HIGH_SIGNAL kelime yoksa at (gürültü süzgeci)
+      3. Önce exact product match, sonra alias match dene
+      4. Öncelik puanı hesapla ve buna göre sırala
+    """
+    # Envanteri normalize et (lowercase, kısa olanları at)
     exact_products = [norm(p) for p in INVENTORY if len(p) >= 3]
 
+    # Sadece envanterde olan vendor'ların alias'larını aktif et
     active_aliases = []
     for entry in VENDOR_ALIASES:
         if any(entry["vendor_key"] in p for p in exact_products):
             active_aliases.extend(norm(a) for a in entry["aliases"])
 
-    seen_titles: set[str] = set()
+    seen_titles: set[str] = set()  # Duplicate başlık tespiti için
     matches = []
 
     for article in articles:
@@ -710,15 +805,19 @@ def match_articles(articles: list[dict]) -> list[dict]:
         title = article.get("title", "")
         norm_title = norm(title)
 
+        # Aynı başlık daha önce eklendiyse atla (cross-feed dedup)
         if norm_title in seen_titles:
             continue
 
+        # İçeriği temizle ve eşleştirme metnini oluştur
         clean_content = norm(strip_html(raw_content))[:3000]
         text = norm_title + " " + clean_content
 
+        # HIGH_SIGNAL kelime yoksa güvenlik haberi değil — atla
         if not any(kw in text for kw in HIGH_SIGNAL):
             continue
 
+        # 1) Exact product match: kelime sınırı ile (substring değil)
         matched_product = None
         for product in exact_products:
             if len(product) < 3:
@@ -728,6 +827,7 @@ def match_articles(articles: list[dict]) -> list[dict]:
                 matched_product = product
                 break
 
+        # 2) Alias match: exact bulunamadıysa alternatif adları dene
         if not matched_product:
             for alias in active_aliases:
                 escaped_alias = re.escape(alias)
@@ -735,6 +835,7 @@ def match_articles(articles: list[dict]) -> list[dict]:
                     matched_product = alias
                     break
 
+        # Hiçbir ürünle eşleşmediyse atla
         if not matched_product:
             continue
 
@@ -744,23 +845,27 @@ def match_articles(articles: list[dict]) -> list[dict]:
             "link": article.get("link", ""),
             "pubDate": article.get("pubDate", ""),
             "matched_product": matched_product,
-            "content": clean_content[:500],
+            "content": clean_content[:500],  # Gemini prompt'una eklenecek RSS özeti
             "priority_score": score_article(text),
         })
 
-    # Öncelik puanına göre sırala (en kritik haberler önce)
+    # Öncelik puanına göre sırala (en kritik haberler önce, ilk 15'i Gemini'ye gider)
     matches.sort(key=lambda x: x["priority_score"], reverse=True)
     return matches
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  PROMPT BUILDING
+#  Gemini'ye gönderilecek prompt'u hazırla. İki kanaldan veri toplanır:
+#    - RSS özeti (hızlı, kısa)
+#    - Makale sayfası tam metni (yavaş, detay için — paralel çekilir)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def build_prompt(matched: list[dict]) -> str:
-    capped = matched[:15]
+    """En kritik 15 makale için Gemini prompt'unu oluştur."""
+    capped = matched[:15]  # Maliyet kontrolü: maks 15 makale
 
-    # Makale sayfalarını paralel çek (versiyon bilgisi için)
+    # Makale sayfalarını paralel çek (8 worker — feed'lerden hızlı)
     log.info("Fetching %d article pages for version details...", len(capped))
     article_bodies: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
@@ -775,6 +880,7 @@ def build_prompt(matched: list[dict]) -> str:
             except Exception:
                 article_bodies[url] = ""
 
+    # Her makale için prompt parçası oluştur
     parts = []
     for i, a in enumerate(capped, 1):
         link = a.get("link", "")
@@ -782,6 +888,7 @@ def build_prompt(matched: list[dict]) -> str:
         rss_content = a.get("content", "")
 
         # Versiyon çıkarma: TAM METİN kullan (5000 char) → kalite korunsun
+        # Bazı advisory'lerde versiyon bilgisi metnin ilerleyen kısımlarında
         combined_text = f"{rss_content} {full_body}"
         versions = extract_versions(combined_text)
         version_str = ", ".join(versions) if versions else "None detected in source"
@@ -790,6 +897,7 @@ def build_prompt(matched: list[dict]) -> str:
         # Versiyonlar zaten "Detected Versions" alanında ayrıca veriliyor
         body_for_gemini = full_body[:1500]
 
+        # Her makaleyi numarayla etiketle ve standart alanlarla biçimle
         parts.append(
             f"[{i}]\n"
             f"Product: {a['matched_product']}\n"
@@ -800,14 +908,23 @@ def build_prompt(matched: list[dict]) -> str:
             f"Article Context: {body_for_gemini}\n"
             f"Detected Versions: {version_str}"
         )
+    # Makaleler arası "---" ayracı (Gemini için görsel bölücü)
     return "\n\n---\n\n".join(parts)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GEMINI ANALYSIS
+#  Prompt'u Gemini API'ye gönder, HTML brifing yanıtını al.
+#  Exponential backoff ile retry: 2s → 4s → 8s (toplam max 3 deneme).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
+    """Gemini API'yi çağır, HTML brifing yanıtını döndür.
+
+    API geçici hata verirse exponential backoff ile tekrar dener.
+    Tüm denemeler başarısız olursa RuntimeError fırlatır.
+    """
+    # API key'i ortam değişkeninden oku (.env'den geldi)
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
@@ -815,13 +932,14 @@ def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
     client = genai.Client(api_key=api_key)
     last_error = None
 
+    # Retry döngüsü
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
-                model="gemini-3.5-flash",
+                model="gemini-3.5-flash",                     # En son Flash modeli
                 contents=prompt,
                 config=genai.types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
+                    system_instruction=SYSTEM_PROMPT,         # CTI Analist rolü
                 ),
             )
             return response.text
@@ -842,8 +960,11 @@ def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  EMAIL
+#  HTML şablonu, taşma tablosu, SMTP gönderim mantığı.
+#  Gmail App Password ile STARTTLS üzerinden gönderilir.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# Ana e-posta şablonu — {date} ve {content} replace edilir
 EMAIL_TEMPLATE = """\
 <!DOCTYPE html>
 <html>
@@ -864,6 +985,7 @@ EMAIL_TEMPLATE = """\
 </body>
 </html>"""
 
+# Eşleşen makale yokken gönderilen "temiz" e-posta içeriği
 NO_THREATS_CONTENT = """\
 <div style="padding:24px;text-align:center;">
   <p style="font-size:48px;margin:0;">✅</p>
@@ -872,6 +994,7 @@ NO_THREATS_CONTENT = """\
   <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki tarama yarın saat 09:00'da gerçekleştirilecektir.</p>
 </div>"""
 
+# Taşma tablosu — 15'in üzerindeki eşleşmeler için (Gemini analizi yok, sadece liste)
 OVERFLOW_HEADER = """\
 <div style="margin-top:32px;padding-top:24px;border-top:2px solid #e0e0e0;">
   <h3 style="color:#495057;font-family:Arial,sans-serif;">📋 Ek Eşleşen Haberler ({count} adet)</h3>
@@ -900,11 +1023,16 @@ OVERFLOW_FOOTER = """\
 
 
 def build_overflow_html(overflow_articles: list[dict]) -> str:
-    """Gemini kapsamı dışında kalan makaleler için basit HTML tablo oluştur."""
+    """Gemini kapsamı dışında kalan makaleler için basit HTML tablo oluştur.
+
+    Bu makaleler analiz edilmez ama e-postanın sonunda başlık+link+ürün
+    olarak listelenir → istihbarat kaybı önlenir.
+    """
     if not overflow_articles:
         return ""
     rows = []
     for a in overflow_articles:
+        # HTML escape — başlık veya link özel karakter içerebilir
         title_escaped = html.escape(a.get("title", "Başlıksız"))
         link = html.escape(a.get("link", "#"))
         product = html.escape(a.get("matched_product", "—"))
@@ -921,30 +1049,40 @@ def build_overflow_html(overflow_articles: list[dict]) -> str:
 
 
 def send_email(subject: str, html_body: str) -> None:
+    """E-postayı SMTP üzerinden gönder. STARTTLS + Gmail App Password kullanır.
+
+    EMAIL_TO virgülle ayrılarak birden fazla alıcıya gönderim destekler.
+    """
+    # SMTP ayarlarını ortamdan oku (varsayılanlar Gmail için)
     smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     username = os.environ.get("SMTP_USERNAME", "")
     password = os.environ.get("SMTP_PASSWORD", "")
     email_from = os.environ.get("EMAIL_FROM", username)
     email_to_raw = os.environ.get("EMAIL_TO", "")
+
     # Virgülle ayrılmış birden fazla alıcı desteklenir
+    # "a@x.com, b@x.com" → ["a@x.com", "b@x.com"]
     recipients = [addr.strip() for addr in email_to_raw.split(",") if addr.strip()]
 
     if not all([username, password, recipients]):
         raise RuntimeError("SMTP credentials or EMAIL_TO not configured")
 
+    # MIME multipart mesajı hazırla (alternative = sadece HTML version var)
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = email_from
-    msg["To"] = ", ".join(recipients)
+    msg["To"] = ", ".join(recipients)  # Header'da görünen liste
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
+    # Güvenli SSL bağlamı (sertifika doğrulama açık)
     context = ssl.create_default_context()
     with smtplib.SMTP(smtp_server, smtp_port) as server:
         server.ehlo()
-        server.starttls(context=context)
+        server.starttls(context=context)  # Şifreli kanala geç (587 → TLS)
         server.ehlo()
         server.login(username, password)
+        # sendmail() liste bekler — tek string verirsen Gmail reddeder
         server.sendmail(email_from, recipients, msg.as_string())
 
     log.info("Email sent to %s", ", ".join(recipients))
@@ -952,44 +1090,47 @@ def send_email(subject: str, html_body: str) -> None:
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  MAIN
+#  Akışın orkestratörü: fetch → filter → match → analyze → email
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def main() -> None:
     log.info("=" * 60)
     log.info("CTI News Feed Automation — started")
-    today = turkish_date()
+    today = turkish_date()  # "17 Mayıs 2026, Cumartesi"
 
-    # 1. Fetch all RSS feeds
+    # 1. Tüm RSS feed'lerini paralel çek (66 kaynak, 10 worker)
     log.info("Fetching %d RSS feeds...", len(FEEDS))
     all_articles = fetch_all_feeds()
     log.info("Total articles fetched: %d", len(all_articles))
 
-    # 2. Filter to last 24 hours
+    # 2. Sadece son 24 saatte yayınlanan makaleleri tut
     recent = filter_recent(all_articles)
     log.info("Articles from last 24h: %d", len(recent))
 
-    # 3. Match against inventory
+    # 3. Envantere göre eşleştir (HIGH_SIGNAL + exact/alias match + öncelik puanı)
     matched = match_articles(recent)
     log.info("Articles matching inventory: %d", len(matched))
 
-    # 4. Analyze & send
+    # 4. Eşleşme varsa Gemini'ye gönder ve e-posta at
     if matched:
-        # İlk 15 makale Gemini ile detaylı analiz edilir
+        # İlk 15 makale Gemini ile detaylı analiz edilir (öncelik puanına göre sıralı)
         top_matches = matched[:15]
-        overflow_matches = matched[15:]
+        overflow_matches = matched[15:]  # Kalanı listede gösterilir
 
         prompt = build_prompt(top_matches)
         log.info("Sending %d articles to Gemini for analysis...", len(top_matches))
         if overflow_matches:
             log.info("Overflow: %d additional articles will be listed without AI analysis.", len(overflow_matches))
 
+        # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
         raw_briefing = analyze_with_gemini(prompt)
         briefing_html = sanitize_gemini_html(raw_briefing)
 
-        # Taşma bölümünü ekle (varsa)
+        # Taşma bölümünü ekle (15'in üzerindeki makaleler için)
         overflow_html = build_overflow_html(overflow_matches)
         full_content = briefing_html + overflow_html
 
+        # E-posta gövdesini oluştur ve gönder
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", full_content)
         send_email(
             subject=f"🛡️ CTI Tehdit Brifing — {today}",
@@ -997,6 +1138,7 @@ def main() -> None:
         )
         log.info("Threat briefing sent successfully.")
     else:
+        # Eşleşme yoksa "tehdit yok" bildirimi gönder
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", NO_THREATS_CONTENT)
         send_email(
             subject=f"✅ CTI Tarama — Tehdit Yok — {today}",
@@ -1007,6 +1149,8 @@ def main() -> None:
     log.info("CTI News Feed Automation — finished")
 
 
+# Script direkt çalıştırıldığında main() tetiklenir
+# Yakalanmayan hatalar log'a yazılır VE systemd'ye yansır (Restart=on-failure tetiklenir)
 if __name__ == "__main__":
     try:
         main()
