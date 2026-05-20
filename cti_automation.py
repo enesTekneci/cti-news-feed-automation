@@ -145,6 +145,29 @@ INVENTORY = [
     "Cisco 2921 Integrated Services Router", "Autocad", "Autocad Lt",
     "Autocad Plant 3D", "Arubanetworks Clearpass", "Claude Code",
     "7-Zip",
+    # ── Microsoft Defender ailesi ────────────────────────
+    "Windows Defender", "365 Defender Portal",
+    "Defender For Endpoint", "Defender For Identity",
+    "Windows Defender For Endpoint",
+    "Defender For Endpoint EDR Sensor",
+    "Defender Security Intelligence Updates",
+    # ── Microsoft diğer ─────────────────────────────────
+    "Windows",
+    # ── VMware ──────────────────────────────────────────
+    "Vmware Workstation",
+    # ── SolarWinds (Orion uzun formları) ────────────────
+    "Orion Network Performance Monitor",
+    "Orion Server And Application Manager",
+    "Orion Network Configuration Manager",
+    # ── IBM (uzun form varyantları) ─────────────────────
+    "QRadar Security Information And Event Manager",
+    "Security Guardium Database Activity Monitor",
+    # ── F5 ──────────────────────────────────────────────
+    "Big-Ip",
+    # ── Red Hat ─────────────────────────────────────────
+    "Enterprise Linux Kernel",
+    # ── Fortinet (uzun form varyantı) ───────────────────
+    "Forticlient Endpoint Management Server",
 ]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
