@@ -117,7 +117,7 @@ echo ""
 echo "[6/7] Systemd service ve timer kuruluyor..."
 # service: ne calistirilacagi tanimi (gunluk gorev)
 cp "${SCRIPT_DIR}/cti-newsfeed.service" /etc/systemd/system/
-# timer: ne zaman calistirilacagi (her gun 09:00)
+# timer: ne zaman calistirilacagi (her gun 11:15 Istanbul)
 cp "${SCRIPT_DIR}/cti-newsfeed.timer"   /etc/systemd/system/
 # 644 = systemd standart izni (root okuma/yazma, digerleri sadece okuma)
 chmod 644 /etc/systemd/system/cti-newsfeed.service
@@ -140,7 +140,7 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Kurulum tamamlandi!"
 echo ""
-echo "  Zamanlama : Her gun saat 09:00"
+echo "  Zamanlama : Her gun saat 11:15 (Istanbul)"
 echo "  Proje     : ${INSTALL_DIR}/"
 echo "  Loglar    : ${INSTALL_DIR}/logs/"
 echo ""
@@ -160,11 +160,10 @@ if [ ! -s "${INSTALL_DIR}/.env" ] || grep -q "your-gemini-api-key-here" "${INSTA
     echo ""
 fi
 
-# Timezone kontrolu — UTC sunucuda 09:00 != Istanbul 09:00
-CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "bilinmiyor")
-if [ "$CURRENT_TZ" = "Etc/UTC" ] || [ "$CURRENT_TZ" = "UTC" ]; then
-    echo "  ⚠  TIMEZONE: Sistem UTC'de — timer 09:00 UTC'de calisir."
-    echo "     Turkiye saati icin:  sudo timedatectl set-timezone Europe/Istanbul"
-    echo ""
-fi
+# Timezone notu — timer artik "Europe/Istanbul" ekiyle saati kendisi sabitliyor,
+# yani sunucu hangi saat diliminde olursa olsun calisma 11:15 Istanbul'da olur.
+# (11:15: Gemini kotasinin gece yarisi Pasifik sifirlamasindan SONRAYA denk gelir.)
+echo "  ℹ  Zamanlama Istanbul saatine sabit (sunucu TZ'sinden bagimsiz)."
+echo "     Dogrulama:  systemctl list-timers | grep ${SERVICE_NAME}"
+echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

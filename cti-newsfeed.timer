@@ -1,9 +1,14 @@
 [Unit]
-Description=CTI News Feed — Gunluk zamanlayici (09:00)
+Description=CTI News Feed — Gunluk zamanlayici (11:15 Istanbul)
 
 [Timer]
-# Her gun Istanbul saatiyle 09:00'da calistir (sunucu UTC ise 06:00 UTC)
-OnCalendar=*-*-* 06:00:00
+# Her gun Istanbul saatiyle 11:15'te calistir.
+# Saat secimi kritik: Gemini ucretsiz kotasi gece yarisi PASIFIK saatinde
+# sifirlanir (yazin ~10:00, kisin ~11:00 Istanbul). 11:15 her iki mevsimde de
+# sifirlamadan SONRAYA denk gelir → bir onceki gunun tukenmis kotasina takilmaz.
+# "Europe/Istanbul" eki sunucu saat dilimi ne olursa olsun saati sabitler
+# (systemd >= 247 gerekli; Ubuntu 22.04+ destekler).
+OnCalendar=*-*-* 11:15:00 Europe/Istanbul
 
 # Sunucu kapali iken atlanan calistirmayi, acilinca otomatik yap
 Persistent=true

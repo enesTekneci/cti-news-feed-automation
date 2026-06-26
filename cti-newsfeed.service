@@ -24,11 +24,12 @@ Group=cti
 UMask=0137
 
 # ── Yeniden deneme politikasi ────────────────────────
-# Hata cikarsa 5 dk bekle, tekrar dene (max saatte 3 deneme)
-Restart=on-failure
-RestartSec=300
-StartLimitBurst=3
-StartLimitIntervalSec=3600
+# Auto-restart KAPALI. Sebebi: acik kalirsa tek bir hata systemd tarafindan
+# her 5 dk'da bir sinirsiz yeniden baslatilarak Gemini API kotasini (RPD) tuketir.
+# (Gecmiste: saatte 12 restart × 3 script-ici retry = 36 istek → 20 RPD limiti asildi.)
+# Gecici hatalar zaten script ici retry ile karsilanir (3 deneme, 2-4-8sn backoff).
+# Calisma basarisiz olursa ertesi gun timer normal sekilde yeniden tetikler.
+Restart=no
 
 # ── Kaynak limitleri ─────────────────────────────────
 # Maks RAM kullanimi (RSS parse + Gemini + mail icin yeterli)

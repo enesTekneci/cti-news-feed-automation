@@ -1024,7 +1024,7 @@ NO_THREATS_CONTENT = """\
   <p style="font-size:48px;margin:0;">✅</p>
   <h2 style="color:#28a745;">Tehdit Tespit Edilmedi</h2>
   <p style="color:#555;">Bugün envanterinizdeki ürünleri etkileyen aktif bir tehdit veya kritik güvenlik açığı tespit edilmedi.</p>
-  <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki tarama yarın saat 09:00'da gerçekleştirilecektir.</p>
+  <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki tarama yarın saat 11:15'te gerçekleştirilecektir.</p>
 </div>"""
 
 # Taşma tablosu — MAX_GEMINI_ARTICLES üzerindeki eşleşmeler için (Gemini analizi yok, sadece liste)
@@ -1183,7 +1183,8 @@ def main() -> None:
 
 
 # Script direkt çalıştırıldığında main() tetiklenir
-# Yakalanmayan hatalar log'a yazılır VE systemd'ye yansır (Restart=on-failure tetiklenir)
+# Yakalanmayan hatalar log'a yazılır ve exit code 1 ile systemd'ye yansır
+# (servis "failed" olarak işaretlenir; auto-restart kapalı olduğu için tekrar başlatılmaz)
 if __name__ == "__main__":
     try:
         main()
