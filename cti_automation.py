@@ -938,11 +938,18 @@ def build_prompt(matched: list[dict]) -> str:
 #  Exponential backoff ile retry: 2s → 4s → 8s (toplam max 3 deneme).
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+_QUOTA_KEYWORDS = ("resource_exhausted", "rate limit", "quota", "429", "rpd", "rpm", "tpm")
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Hata mesajında kota/rate-limit ifadesi var mı kontrol et."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _QUOTA_KEYWORDS)
+
 def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
     """Gemini API'yi çağır, HTML brifing yanıtını döndür.
 
-    API geçici hata verirse exponential backoff ile tekrar dener.
-    Tüm denemeler başarısız olursa RuntimeError fırlatır.
+    Geçici hatalarda exponential backoff ile tekrar dener.
+    Kota/rate-limit hatalarında retry yapmaz (boşa istek harcamaz).
     """
     # API key'i ortam değişkeninden oku (.env'den geldi)
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -965,6 +972,12 @@ def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
             return response.text
         except Exception as exc:
             last_error = exc
+            # Kota hatası → retry boşa gider, hemen çık
+            if _is_quota_error(exc):
+                log.error(
+                    "Gemini API quota/rate-limit aşıldı — retry yapılmıyor: %s", exc,
+                )
+                raise RuntimeError("Gemini API günlük kota (RPD) doldu") from exc
             if attempt < max_retries:
                 wait = 2 ** attempt  # 2s, 4s, 8s exponential backoff
                 log.warning(
