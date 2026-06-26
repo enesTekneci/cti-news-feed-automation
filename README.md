@@ -6,7 +6,7 @@ Bu rehber, CTI News Feed Automation projesini Ubuntu sunucusuna kurmak ve system
 
 ## Gereksinimler
 
-- Ubuntu 20.04 / 22.04 / 24.04 (veya Debian tabanli dagitim)
+- Ubuntu 22.04 / 24.04 (Debian tabanli dagitim) — timer'daki `Europe/Istanbul` saat dilimi eki systemd 247+ gerektirir (20.04 desteklemez)
 - Python 3.10+
 - Internete erisim (RSS feed ve Gemini API icin)
 - Gmail hesabi + App Password (SMTP icin)
@@ -22,7 +22,7 @@ Repo'yu klonla ve setup scriptini calistir:
 # 1. Repo'yu klonla
 cd /tmp
 git clone <REPO_URL> cti-project
-cd cti-project/linux-ubuntu
+cd cti-project
 
 # 2. Setup scriptini calistir (root gerekli)
 sudo bash setup.sh
@@ -44,7 +44,7 @@ Setup scripti su islemleri otomatik yapar:
 - Python sanal ortami olusturur ve bagimliliklari yukler
 - Dosya izinlerini guvenli sekilde ayarlar
 - Systemd service ve timer dosyalarini kurar
-- Timer'i etkinlestirir (her gun 09:00)
+- Timer'i etkinlestirir (her gun 11:15 Istanbul)
 
 ---
 
@@ -144,14 +144,14 @@ sudo -u cti /opt/cti-project/venv/bin/python3 /opt/cti-project/cti_automation.py
 Basarili cikti ornegi:
 ```
 CTI News Feed Automation — started
-Fetching 44 RSS feeds...
+Fetching 66 RSS feeds...
   CISA Advisories: 30 articles
   Cisco PSIRT Advisories: 50 articles
   ...
 Total articles fetched: 6535
 Articles from last 24h: 283
 Articles matching inventory: 28
-Sending 15 articles to Gemini for analysis...
+Sending 28 articles to Gemini for analysis...
 Email sent to alici-adres@gmail.com
 Threat briefing sent successfully.
 CTI News Feed Automation — finished
@@ -160,8 +160,8 @@ CTI News Feed Automation — finished
 ### Adim 8: Systemd service dosyasini kur
 
 ```bash
-sudo cp /tmp/cti-project-repo/linux-ubuntu/cti-newsfeed.service /etc/systemd/system/
-sudo cp /tmp/cti-project-repo/linux-ubuntu/cti-newsfeed.timer   /etc/systemd/system/
+sudo cp /tmp/cti-project-repo/cti-newsfeed.service /etc/systemd/system/
+sudo cp /tmp/cti-project-repo/cti-newsfeed.timer   /etc/systemd/system/
 sudo chmod 644 /etc/systemd/system/cti-newsfeed.service
 sudo chmod 644 /etc/systemd/system/cti-newsfeed.timer
 ```
@@ -186,8 +186,7 @@ WorkingDirectory=/opt/cti-project
 ExecStart=/opt/cti-project/venv/bin/python3 /opt/cti-project/cti_automation.py
 User=cti
 Group=cti
-Restart=on-failure
-RestartSec=300
+Restart=no
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -211,10 +210,10 @@ sudo nano /etc/systemd/system/cti-newsfeed.timer
 
 ```ini
 [Unit]
-Description=CTI News Feed — Gunluk zamanlayici (09:00)
+Description=CTI News Feed — Gunluk zamanlayici (11:15 Istanbul)
 
 [Timer]
-OnCalendar=*-*-* 09:00:00
+OnCalendar=*-*-* 11:15:00 Europe/Istanbul
 Persistent=true
 AccuracySec=60
 
@@ -372,8 +371,8 @@ sudo chmod 700 /opt/cti-project/cti_automation.py
 sudo /opt/cti-project/venv/bin/pip install -r /opt/cti-project/requirements.txt
 
 # Systemd dosyalari degistiyse
-sudo cp /tmp/cti-update/linux-ubuntu/cti-newsfeed.service /etc/systemd/system/
-sudo cp /tmp/cti-update/linux-ubuntu/cti-newsfeed.timer   /etc/systemd/system/
+sudo cp /tmp/cti-update/cti-newsfeed.service /etc/systemd/system/
+sudo cp /tmp/cti-update/cti-newsfeed.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl restart cti-newsfeed.timer
 
