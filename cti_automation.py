@@ -935,21 +935,49 @@ def build_prompt(matched: list[dict]) -> str:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GEMINI ANALYSIS
 #  Prompt'u Gemini API'ye gönder, HTML brifing yanıtını al.
-#  Exponential backoff ile retry: 2s → 4s → 8s (toplam max 3 deneme).
+#  Katmanlı dayanıklılık: model-içi retry + yedek model zinciri + kalıcı hatada dur.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_QUOTA_KEYWORDS = ("resource_exhausted", "rate limit", "quota", "429", "rpd", "rpm", "tpm")
+# ── Hata sınıflandırma ───────────────────────────────────────────────────────
+# Gemini API hataları üç gruba ayrılır; her grup farklı ele alınır:
+#   permanent  → anahtar/istek hatası; ne retry ne model değişimi düzeltir → dur
+#   next_model → bu model kullanılamıyor (kota dolu / model yok) → yedek modele geç
+#   transient  → 503/500/504/ağ; kısa bekle, aynı modelde tekrar dene, sonra yedeğe
+_PERMANENT_KEYWORDS = (
+    "permission_denied", "unauthenticated", "api key not valid",
+    "invalid_argument", "failed_precondition",
+)
+_NEXT_MODEL_KEYWORDS = ("resource_exhausted", "quota", "rate limit", "not_found")
 
-def _is_quota_error(exc: Exception) -> bool:
-    """Hata mesajında kota/rate-limit ifadesi var mı kontrol et."""
+def _classify_error(exc: Exception) -> str:
+    """API hatasını 'permanent' | 'next_model' | 'transient' olarak sınıflandır."""
     msg = str(exc).lower()
-    return any(kw in msg for kw in _QUOTA_KEYWORDS)
+    code = getattr(exc, "code", None)  # google-genai HTTP status (int) — varsa
+    if code in (400, 401, 403) or any(k in msg for k in _PERMANENT_KEYWORDS):
+        return "permanent"
+    if code in (404, 429) or any(k in msg for k in _NEXT_MODEL_KEYWORDS):
+        return "next_model"
+    # 503/500/504/ağ + bilinmeyen hatalar → temkinli: geçici say (retry + fallback)
+    return "transient"
 
-def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
+
+# Model zinciri: birincil (en kaliteli) + yedekler. Birincil model erişilemez veya
+# kotası dolu olursa sıradaki denenir. Her modelin AYRI günlük kotası ve AYRI
+# kapasitesi var → 3.5-flash 20 RPD'yi doldursa ya da 503 verse bile brifing kurtulur.
+_MODEL_CHAIN = ("gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash")
+
+# Geçici hatada model-içi bekleme programı (saniye). Kısa tutulur: yoğunluk geçmezse
+# zaten yedek modele düşülür (toplam süre TimeoutStartSec=600 altında kalsın).
+_TRANSIENT_BACKOFF = (10, 30)
+
+
+def analyze_with_gemini(prompt: str) -> str:
     """Gemini API'yi çağır, HTML brifing yanıtını döndür.
 
-    Geçici hatalarda exponential backoff ile tekrar dener.
-    Kota/rate-limit hatalarında retry yapmaz (boşa istek harcamaz).
+    Katmanlı dayanıklılık:
+      1) Geçici hata (503/500/ağ) → aynı modelde kısa beklemeyle tekrar dene
+      2) Kota dolu / model yok / geçici hata sürüyor → yedek modele geç
+      3) Anahtar/istek hatası (kalıcı) → hemen dur (hiçbir şey düzeltmez)
     """
     # API key'i ortam değişkeninden oku (.env'den geldi)
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -958,37 +986,61 @@ def analyze_with_gemini(prompt: str, max_retries: int = 3) -> str:
 
     client = genai.Client(api_key=api_key)
     last_error = None
+    max_attempts = len(_TRANSIENT_BACKOFF) + 1  # model başına: 1 ilk + retry sayısı
 
-    # Retry döngüsü
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.5-flash",                     # En son Flash modeli
-                contents=prompt,
-                config=genai.types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,         # CTI Analist rolü
-                ),
-            )
-            return response.text
-        except Exception as exc:
-            last_error = exc
-            # Kota hatası → retry boşa gider, hemen çık
-            if _is_quota_error(exc):
-                log.error(
-                    "Gemini API quota/rate-limit aşıldı — retry yapılmıyor: %s", exc,
+    # Dış döngü: modeller (birincil → yedekler)
+    for model in _MODEL_CHAIN:
+        # İç döngü: aynı model için geçici hata retry'ları
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=genai.types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,     # CTI Analist rolü
+                    ),
                 )
-                raise RuntimeError("Gemini API günlük kota (RPD) doldu") from exc
-            if attempt < max_retries:
-                wait = 2 ** attempt  # 2s, 4s, 8s exponential backoff
-                log.warning(
-                    "Gemini API attempt %d/%d failed: %s — retrying in %ds",
-                    attempt, max_retries, exc, wait,
-                )
-                time.sleep(wait)
-            else:
-                log.error("Gemini API failed after %d attempts: %s", max_retries, exc)
+                # Yedek model kullanıldıysa görünür kıl (kalite/teşhis için)
+                if model != _MODEL_CHAIN[0]:
+                    log.warning("Brifing YEDEK model ile üretildi: %s", model)
+                return response.text
+            except Exception as exc:
+                last_error = exc
+                kind = _classify_error(exc)
 
-    raise RuntimeError(f"Gemini API failed after {max_retries} attempts") from last_error
+                # Kalıcı hata → geçersiz anahtar/istek; model veya retry çözmez
+                if kind == "permanent":
+                    log.error("Gemini kalıcı hata (%s): %s", model, exc)
+                    raise RuntimeError(
+                        "Gemini API kalıcı hata (API anahtarı/istek geçersiz)"
+                    ) from exc
+
+                # Bu model kullanılamıyor (kota dolu / model yok) → yedeğe geç
+                if kind == "next_model":
+                    log.warning(
+                        "Model '%s' kullanılamıyor (kota/model yok), yedeğe geçiliyor: %s",
+                        model, exc,
+                    )
+                    break  # iç döngüden çık → sıradaki model
+
+                # Geçici hata → kısa bekle ve aynı modelde tekrar dene
+                if attempt < max_attempts:
+                    wait = _TRANSIENT_BACKOFF[attempt - 1]
+                    log.warning(
+                        "Model '%s' geçici hata (deneme %d/%d): %s — %dsn sonra tekrar",
+                        model, attempt, max_attempts, exc, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    # Bu modelde geçici hata sürüyor → yedeğe geç (iç döngü biter)
+                    log.warning(
+                        "Model '%s' geçici hatada tükendi, yedeğe geçiliyor: %s",
+                        model, exc,
+                    )
+
+    # Hiçbir model başaramadı
+    log.error("Tüm modeller başarısız oldu: %s", ", ".join(_MODEL_CHAIN))
+    raise RuntimeError("Gemini API: tüm modeller başarısız oldu") from last_error
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
