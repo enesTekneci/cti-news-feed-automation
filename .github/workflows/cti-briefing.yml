@@ -1,0 +1,121 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  CTI Tehdit Brifingi — GitHub Actions ile gunluk otomasyon
+#  Ubuntu sunucudaki systemd timer'in yerini alir.
+#  Public repo oldugu icin Actions dakikalari UCRETSIZ ve sinirsizdir.
+#
+#  KURULUM: Settings > Secrets and variables > Actions altina 5 secret ekle:
+#    GEMINI_API_KEY, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
+#  (SMTP_SERVER/SMTP_PORT gizli bilgi degil, asagida sabit yazili.)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+name: CTI Tehdit Brifingi
+
+on:
+  schedule:
+    # Her gun 11:15 Istanbul saati. "timezone" anahtari sayesinde yaz/kis saati
+    # otomatik ayarlanir (UTC hesabi yapmaya gerek yok).
+    # 11:15 secimi: Gemini kotasi gece yarisi Pasifik'te sifirlanir; bu saat
+    # her iki mevsimde de sifirlamadan SONRAYA denk gelir.
+    - cron: '15 11 * * *'
+      timezone: "Europe/Istanbul"
+  # Actions sekmesinden "Run workflow" butonu ile elle de calistirilabilir
+  workflow_dispatch:
+
+# Ayni anda birden fazla calistirma olmasin (elle tetikleme + zamanlanmis cakisirsa)
+concurrency:
+  group: cti-briefing
+  cancel-in-progress: false
+
+# Varsayilan olarak sadece okuma; yazma yetkisi sadece keepalive job'inda acilir
+permissions:
+  contents: read
+
+jobs:
+  # ── Ana is: brifingi uret ve mail at ────────────────────────────────────
+  briefing:
+    runs-on: ubuntu-latest
+    # Takilirsa 20 dk sonra durdur (normalde ~2 dk surer)
+    timeout-minutes: 20
+
+    steps:
+      - name: Repoyu indir
+        uses: actions/checkout@v7
+
+      - name: Python kur
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'   # bagimliliklari onbellekle (kurulum hizlanir)
+
+      - name: Bagimliliklari yukle
+        run: pip install -r requirements.txt
+
+      # Secret eksikse anlasilir hata ver (yoksa kod tuhaf sekilde patlar)
+      - name: Secret kontrolu
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SMTP_USERNAME:  ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+        run: |
+          eksik=""
+          for s in GEMINI_API_KEY SMTP_USERNAME SMTP_PASSWORD EMAIL_FROM EMAIL_TO; do
+            [ -z "${!s}" ] && eksik="$eksik $s"
+          done
+          if [ -n "$eksik" ]; then
+            echo "::error::Eksik secret(lar):$eksik"
+            echo "Settings > Secrets and variables > Actions altindan ekleyin."
+            exit 1
+          fi
+          echo "✓ Tum secret'lar tanimli"
+
+      - name: Brifingi calistir
+        env:
+          # Gizli degerler — GitHub Secrets'tan gelir, loglarda otomatik maskelenir
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SMTP_USERNAME:  ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          # Gizli olmayan ayarlar (bos string gecmemek icin sabit yazildi)
+          SMTP_SERVER: smtp.gmail.com
+          SMTP_PORT: "587"
+        run: python cti_automation.py
+
+      # Hata olursa uygulama logunu indirilebilir yap (teshis icin)
+      - name: Hata durumunda logu yukle
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cti-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ── Keepalive: 60 gun kuralina karsi ────────────────────────────────────
+  # Public repolarda 60 gun boyunca commit olmazsa GitHub zamanlanmis
+  # workflow'u SESSIZCE kapatir. Ayin 1'inde kucuk bir commit atip repoyu
+  # aktif tutar. always(): brifing hata verse bile zamanlayici yasasin.
+  keepalive:
+    needs: briefing
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # commit atabilmek icin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ayin 1'iyse heartbeat commit at
+        run: |
+          if [ "$(date -u +%d)" != "01" ]; then
+            echo "Bugun ayin 1'i degil — keepalive atlaniyor."
+            exit 0
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/heartbeat.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/heartbeat.txt
+          git commit -m "chore: keepalive heartbeat (60 gun kurali)" || exit 0
+          git push
+          echo "✓ Heartbeat commit atildi — zamanlayici aktif kalacak"
