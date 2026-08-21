@@ -458,7 +458,6 @@ HER HABER İÇİN aşağıdaki HTML formatında bir brifing bloğu yaz:
   <h3 style="margin:0 0 8px 0;color:[SEVERİTE_RENK];">[SEVERİTE: YÜKSEK/ORTA/DÜŞÜK] Haber Başlığı</h3>
   [[IMG:n]]
   <p><strong>📅 Tarih:</strong> Yayın tarihi</p>
-  <p><strong>🔗 Kaynak:</strong> <a href="LINK">LINK</a></p>
   <p><strong>💾 Eşleşen Ürün:</strong> matched_product değeri</p>
   <p><strong>🔴 Etkilenen Sürümler:</strong> Zafiyetten etkilenen (savunmasız) versiyon numaraları/aralıkları</p>
   <p><strong>🟢 Yamalı Sürümler:</strong> Yamayı içeren güvenli versiyon numaraları (yükseltme hedefi)</p>
@@ -466,6 +465,9 @@ HER HABER İÇİN aşağıdaki HTML formatında bir brifing bloğu yaz:
   <p><strong>📝 Özet:</strong> Temel tehdit veya sorunu 25 kelimede özetle</p>
   <p><strong>🛡️ Aksiyon:</strong> Doğrudan talimat</p>
   <p><strong>💡 Öneri:</strong> Bir stratejik tavsiye</p>
+  <p style="margin:16px 0 0;text-align:center;">
+    <a href="LINK" style="display:inline-block;padding:10px 22px;background:#1a1a2e;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:bold;font-size:13px;">Habere Git →</a>
+  </p>
 </div>
 
 SEVERİTE_RENK: YÜKSEK=#dc3545, ORTA=#fd7e14, DÜŞÜK=#28a745
@@ -479,7 +481,9 @@ KURALLAR:
 - Eğer iki haber aynı CVE veya olayı işliyorsa, ikincisi için yalnızca şunu yaz:
   <div style="margin-bottom:24px;padding:12px;border-left:4px solid #6c757d;background:#f9f9f9;font-family:Arial,sans-serif;">
     <p><strong>Aynı konu hakkında ek haber:</strong> İlk haberin başlığı</p>
-    <p><strong>🔗 Link:</strong> <a href="LINK">LINK</a></p>
+    <p style="margin:8px 0 0;text-align:center;">
+      <a href="LINK" style="display:inline-block;padding:6px 16px;border:1.5px solid #6c757d;color:#6c757d;text-decoration:none;border-radius:6px;font-weight:bold;font-size:12px;">Habere Git →</a>
+    </p>
   </div>
 - Her haberde "Full Article Content" ve "Detected Versions" alanları verilmiştir. Versiyon bilgisini doldururken bu verileri DİKKATLİCE analiz et:
   * "Etkilenen Sürümler" alanına YALNIZCA zafiyetten etkilenen (savunmasız) versiyonları yaz. "< 12.1.4-h5" ifadesi "12.1.4-h5'ten önceki tüm sürümler etkileniyor" demektir. Ürün adıyla birlikte yaz (örn. "PAN-OS 11.2.0 – 11.2.4-h16", "FortiOS < 7.4.7").
