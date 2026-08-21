@@ -22,9 +22,12 @@ import logging.handlers              # RotatingFileHandler (log boyut sınırı)
 import smtplib                       # SMTP ile e-posta gönderme
 import ssl                           # STARTTLS bağlantısı
 import time                          # exponential backoff retry
+import urllib.parse                  # URL resolve için
+from io import BytesIO               # Bellekte görsel işlemek için
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from html.parser import HTMLParser   # Gemini HTML çıktısını sanitize
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Paralel RSS çekme
 from pathlib import Path
@@ -34,6 +37,10 @@ import feedparser                    # RSS/Atom/JSON Feed parser
 import requests                      # HTTP istekleri (article fetch)
 from google import genai             # Gemini AI SDK
 from dotenv import load_dotenv       # .env dosyasından credentials oku
+from PIL import Image                # Görsel optimizasyonu
+
+# Decompression bomb koruması: Pillow MAX_IMAGE_PIXELS açıkça sınırlanır (Spec kuralı)
+Image.MAX_IMAGE_PIXELS = 40_000_000
 
 # .env dosyasını yükle — API key'ler ve SMTP bilgileri buradan gelir
 load_dotenv(Path(__file__).parent / ".env")
@@ -82,6 +89,12 @@ MAX_GEMINI_ARTICLES = 50       # Gemini'ye gönderilecek maks makale sayısı
 MAX_BODY_CHARS      = 10_000   # Makale sayfasından çekilecek maks metin (versiyon çıkarma)
 GEMINI_BODY_CHARS   = 3_000    # Gemini prompt'una gönderilecek makale bağlamı
 MAX_PROMPT_TOKENS   = 100_000  # Toplam prompt token üst sınırı (TPM güvenlik payı)
+MAX_IMAGE_ARTICLES     = 10          # Görsel aranacak makale sayısı
+MAX_DOWNLOAD_BYTES     = 2_000_000   # İndirme tavanı (optimizasyon öncesi)
+IMAGE_TARGET_WIDTH     = 1280        # 640px görüntüleme × 2 (retina)
+IMAGE_JPEG_QUALITY     = 85
+MAX_TOTAL_IMAGE_BYTES  = 5_000_000   # Tüm görsellerin toplam tavanı
+IMAGE_FETCH_TIMEOUT    = 8
 # Token matematiği (50 makale × ~900 token/makale ≈ 45K token):
 #   Günlük bütçe: 250K → %18 kullanım. TPM: tek istek/gün, aşım riski yok.
 #   Makale sayısı artarsa body_chars dinamik olarak kısılır (build_prompt içinde).
@@ -443,6 +456,7 @@ HER HABER İÇİN aşağıdaki HTML formatında bir brifing bloğu yaz:
 
 <div style="margin-bottom:24px;padding:16px;border-left:4px solid [SEVERİTE_RENK];background:#f9f9f9;font-family:Arial,sans-serif;">
   <h3 style="margin:0 0 8px 0;color:[SEVERİTE_RENK];">[SEVERİTE: YÜKSEK/ORTA/DÜŞÜK] Haber Başlığı</h3>
+  [[IMG:n]]
   <p><strong>📅 Tarih:</strong> Yayın tarihi</p>
   <p><strong>🔗 Kaynak:</strong> <a href="LINK">LINK</a></p>
   <p><strong>💾 Eşleşen Ürün:</strong> matched_product değeri</p>
@@ -461,6 +475,7 @@ KURALLAR:
 - Giriş veya sonuç cümlesi YAZMA. Doğrudan ilk brifing bloğuyla başla.
 - "Özet" 25 kelimeyi geçmemeli.
 - "Aksiyon" imperatif ve doğrudan olmalı. Spesifik bir aksiyon yoksa: "Güncellemeleri takip et."
+- Her brifing bloğunda <h3> başlığının hemen altına tam olarak [[IMG:n]] yaz (n, o makalenin sana verilen numarasıdır, örneğin [[IMG:1]]). Görseli olsa da olmasa da bu token'ı mutlaka ekle.
 - Eğer iki haber aynı CVE veya olayı işliyorsa, ikincisi için yalnızca şunu yaz:
   <div style="margin-bottom:24px;padding:12px;border-left:4px solid #6c757d;background:#f9f9f9;font-family:Arial,sans-serif;">
     <p><strong>Aynı konu hakkında ek haber:</strong> İlk haberin başlığı</p>
@@ -653,18 +668,23 @@ _SSRF_BLOCKED = re.compile(
 )
 
 
-def fetch_article_body(url: str, timeout: int = 12) -> str:
-    """Makale URL'sine gidip sayfa içeriğini düz metin olarak döndürür.
+_OG_IMAGE_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image["\']',
+    re.IGNORECASE
+)
+
+def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
+    """Makale URL'sine gidip sayfa içeriğini ve og:image URL'sini döndürür.
 
     Tam sayfa içeriği (MAX_BODY_CHARS) versiyon çıkarma için kullanılır.
-    Gemini'ye daha kısa bağlam gönderilir (GEMINI_BODY_CHARS — build_prompt içinde).
+    og:image e-posta içi görsel optimizasyonunda aday olarak kullanılır.
     """
     if not url or not url.startswith("http"):
-        return ""
+        return "", ""
     # SSRF koruması
     if _SSRF_BLOCKED.search(url):
         log.warning("SSRF blocked: %s", url)
-        return ""
+        return "", ""
     try:
         # max_redirects=3: sonsuz redirect loop'unu önler
         session = requests.Session()
@@ -674,12 +694,19 @@ def fetch_article_body(url: str, timeout: int = 12) -> str:
             allow_redirects=True,
         )
         resp.raise_for_status()
+
+        # og:image çıkar (sayfa başındaki meta tag'lerde aranır, ilk 8KB yeterli)
+        og_image = ""
+        m = _OG_IMAGE_RE.search(resp.text[:8192])
+        if m:
+            og_image = m.group(1) or m.group(2) or ""
+
         raw = strip_html(resp.text)
-        return _WHITESPACE.sub(" ", raw).strip()[:MAX_BODY_CHARS]
+        return _WHITESPACE.sub(" ", raw).strip()[:MAX_BODY_CHARS], og_image
     except Exception as exc:
         # Bir makale çekilemese bile diğerleri devam etmeli — sessizce logla
         log.warning("Article fetch failed (%s): %s", url, exc)
-        return ""
+        return "", ""
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -688,6 +715,37 @@ def fetch_article_body(url: str, timeout: int = 12) -> str:
 #  Her feed paralel çekilir (10 worker thread), tek bir yavaş feed
 #  toplam süreyi yavaşlatmaz.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_rss_image(entry) -> str:
+    """RSS entry'den görsel adayı çıkar."""
+    # Check media:thumbnail
+    media_thumbnail = getattr(entry, "media_thumbnail", [])
+    if media_thumbnail and isinstance(media_thumbnail, list) and 'url' in media_thumbnail[0]:
+        return media_thumbnail[0]['url']
+    # Check media:content
+    media_content = getattr(entry, "media_content", [])
+    if media_content and isinstance(media_content, list) and 'url' in media_content[0]:
+        return media_content[0]['url']
+    # Check enclosures
+    enclosures = getattr(entry, "enclosures", [])
+    for enc in enclosures:
+        if getattr(enc, "type", "").startswith("image/") and hasattr(enc, "href"):
+            return enc.href
+    # Check links
+    links = getattr(entry, "links", [])
+    for link in links:
+        if getattr(link, "rel", "") == "enclosure" and getattr(link, "type", "").startswith("image/") and hasattr(link, "href"):
+            return link.href
+    # Fallback: first <img src> in content
+    content_str = ""
+    if hasattr(entry, "content") and entry.content:
+        content_str = entry.content[0].value
+    elif hasattr(entry, "summary"):
+        content_str = entry.summary
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content_str, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return ""
 
 def fetch_feed(name: str, url: str) -> list[dict]:
     """Tek bir RSS feed'i çek ve makale listesi olarak döndür."""
@@ -706,6 +764,7 @@ def fetch_feed(name: str, url: str) -> list[dict]:
                 "content_encoded": (
                     entry.content[0].value if hasattr(entry, "content") and entry.content else ""
                 ),
+                "image_candidate": get_rss_image(entry),
                 "source": name,
             })
         return articles
@@ -857,6 +916,7 @@ def match_articles(articles: list[dict]) -> list[dict]:
             "matched_product": matched_product,
             "content": clean_content[:500],  # Gemini prompt'una eklenecek RSS özeti
             "priority_score": score_article(text),
+            "image_candidate": article.get("image_candidate", ""),
         })
 
     # Öncelik puanına göre sırala (en kritik haberler önce, ilk MAX_GEMINI_ARTICLES tanesi Gemini'ye gider)
@@ -887,24 +947,25 @@ def build_prompt(matched: list[dict]) -> str:
 
     # Makale sayfalarını paralel çek (8 worker — feed'lerden hızlı)
     log.info("Fetching %d article pages for version details...", len(capped))
-    article_bodies: dict[str, str] = {}
+    article_pages: dict[str, tuple[str, str]] = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         future_map = {
-            pool.submit(fetch_article_body, a.get("link", "")): a.get("link", "")
+            pool.submit(fetch_article_page, a.get("link", "")): a.get("link", "")
             for a in capped
         }
         for future in as_completed(future_map):
             url = future_map[future]
             try:
-                article_bodies[url] = future.result()
+                article_pages[url] = future.result()
             except Exception:
-                article_bodies[url] = ""
+                article_pages[url] = ("", "")
 
     # Her makale için prompt parçası oluştur
     parts = []
     for i, a in enumerate(capped, 1):
         link = a.get("link", "")
-        full_body = article_bodies.get(link, "")
+        full_body, og_image = article_pages.get(link, ("", ""))
+        a["og_image"] = og_image
         rss_content = a.get("content", "")
 
         # Versiyon çıkarma: TAM METİN kullan (MAX_BODY_CHARS) → kalite korunsun
@@ -1133,7 +1194,111 @@ def build_overflow_html(overflow_articles: list[dict]) -> str:
     )
 
 
-def send_email(subject: str, html_body: str) -> None:
+def process_image(url: str, article_link: str) -> bytes | None:
+    """Görseli indir, doğrula ve e-posta için optimize et.
+
+    Güvenlik zinciri: SSRF (istek öncesi + redirect sonrası) → SVG reddi →
+    boyut tavanı → magic byte doğrulaması → Pillow ile yeniden boyutlandırma.
+    Herhangi bir adım başarısız olursa None döner; brifing etkilenmez.
+    """
+    if not url:
+        return None
+    try:
+        # Göreceli URL'yi makale linkine göre mutlak hale getir
+        full_url = urllib.parse.urljoin(article_link, url)
+        if not full_url.startswith(("http://", "https://")):
+            return None
+
+        # SSRF: istek göndermeden önce kontrol
+        if _SSRF_BLOCKED.search(full_url):
+            log.warning("SSRF blocked image pre-request: %s", full_url)
+            return None
+
+        session = requests.Session()
+        session.max_redirects = 3
+        # stream=True: tamamını belleğe almadan boyut tavanını uygulayabilmek için
+        resp = session.get(full_url, headers=_REQUEST_HEADERS, timeout=IMAGE_FETCH_TIMEOUT, stream=True)
+        resp.raise_for_status()
+
+        # SSRF: redirect sonrası NIHAI adresi tekrar kontrol et
+        # (iç ağa yönlendirme bilinen bypass yöntemidir)
+        if _SSRF_BLOCKED.search(resp.url):
+            log.warning("SSRF blocked image post-redirect: %s", resp.url)
+            return None
+
+        # SVG reddi — script taşıyabilir
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if "image/svg+xml" in content_type:
+            log.warning("SVG rejected: %s", full_url)
+            return None
+
+        chunks = []
+        downloaded = 0
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                chunks.append(chunk)
+                downloaded += len(chunk)
+                if downloaded > MAX_DOWNLOAD_BYTES:
+                    log.warning("Image exceeded MAX_DOWNLOAD_BYTES: %s", full_url)
+                    return None
+        data = b"".join(chunks)
+        if not data:
+            return None
+
+        # Magic byte doğrulaması — Content-Type başlığına güvenilmez
+        is_jpeg = data.startswith(b"\xff\xd8\xff")
+        is_png = data.startswith(b"\x89PNG\r\n\x1a\n")
+        is_gif = data.startswith(b"GIF8")
+        is_webp = data.startswith(b"RIFF") and len(data) > 11 and data[8:12] == b"WEBP"
+
+        if not (is_jpeg or is_png or is_gif or is_webp):
+            log.warning("Magic byte mismatch or unsupported format: %s", full_url)
+            return None
+
+        with Image.open(BytesIO(data)) as img:
+            # Sadece hedeften büyükse küçült (küçük görseller büyütülmez)
+            if img.width > IMAGE_TARGET_WIDTH:
+                ratio = IMAGE_TARGET_WIDTH / img.width
+                new_height = int(img.height * ratio)
+                img = img.resize((IMAGE_TARGET_WIDTH, new_height), Image.Resampling.LANCZOS)
+
+            # Şeffaflık varsa beyaz zemine yerleştir, JPEG için RGB'ye çevir
+            if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                bg = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
+            return out.getvalue()
+    except Exception as exc:
+        log.warning("Image processing failed (%s): %s", url, exc)
+        return None
+
+def inject_images(html_str: str, cid_map: dict[int, str], titles_map: dict[int, str]) -> str:
+    """[[IMG:n]] token'larını gerçek <img> tag'i ile değiştir.
+
+    ÖNEMLİ: Bu fonksiyon sanitize_gemini_html() SONRASINDA çalışır. Böylece
+    eklenen HTML'i tamamen kod üretir ve sanitizer whitelist'ine img/src
+    eklemek gerekmez (prompt injection ile takip pikseli sokulamaz).
+    Görseli olmayan token'lar tamamen silinir.
+    """
+    def repl(m):
+        n = int(m.group(1))
+        if n in cid_map:
+            alt_text = html.escape(titles_map.get(n, ""), quote=True)
+            return f'<img src="cid:{cid_map[n]}" style="width:100%;height:auto;border-radius:4px;margin:8px 0;" alt="{alt_text}">'
+        return ""
+    return re.sub(r'\[\[IMG:(\d+)\]\]', repl, html_str)
+
+
+
+def send_email(subject: str, html_body: str,
+               images: list[tuple[str, bytes]] | None = None) -> None:
     """E-postayı SMTP üzerinden gönder. STARTTLS + Gmail App Password kullanır.
 
     EMAIL_TO virgülle ayrılarak birden fazla alıcıya gönderim destekler.
@@ -1153,12 +1318,26 @@ def send_email(subject: str, html_body: str) -> None:
     if not all([username, password, recipients]):
         raise RuntimeError("SMTP credentials or EMAIL_TO not configured")
 
-    # MIME multipart mesajı hazırla (alternative = sadece HTML version var)
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = email_from
-    msg["To"] = ", ".join(recipients)  # Header'da görünen liste
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    if images:
+        msg = MIMEMultipart("related")
+        msg["Subject"] = subject
+        msg["From"] = email_from
+        msg["To"] = ", ".join(recipients)
+        msg_alt = MIMEMultipart("alternative")
+        msg_alt.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(msg_alt)
+        for cid, data in images:
+            img_part = MIMEImage(data, _subtype="jpeg")
+            img_part.add_header("Content-ID", f"<{cid}>")
+            img_part.add_header("Content-Disposition", "inline")
+            msg.attach(img_part)
+    else:
+        # Görsel yoksa mevcut alternative yapısı korunur
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = email_from
+        msg["To"] = ", ".join(recipients)
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     # Güvenli SSL bağlamı (sertifika doğrulama açık)
     context = ssl.create_default_context()
@@ -1207,19 +1386,66 @@ def main() -> None:
         if overflow_matches:
             log.info("Overflow: %d additional articles will be listed without AI analysis.", len(overflow_matches))
 
+        # Görselleri indir ve optimize et (sadece en kritik makaleler)
+        image_tasks = []
+        for i, a in enumerate(top_matches[:MAX_IMAGE_ARTICLES], 1):
+            url = a.get("image_candidate") or a.get("og_image")
+            if url:
+                image_tasks.append((i, url, a.get("link", ""), a.get("title", "")))
+
+        results_by_index = {}
+        if image_tasks:
+            log.info("Processing %d candidate images...", len(image_tasks))
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                future_to_idx = {
+                    pool.submit(process_image, task[1], task[2]): task
+                    for task in image_tasks
+                }
+                for future in as_completed(future_to_idx):
+                    task = future_to_idx[future]
+                    idx = task[0]
+                    try:
+                        results_by_index[idx] = (future.result(), task[3])
+                    except Exception as e:
+                        log.warning("Image worker failed for %s: %s", task[1], e)
+                        results_by_index[idx] = (None, task[3])
+
+        cid_map = {}
+        titles_map = {}
+        total_image_bytes = 0
+        final_images = []
+
+        # Priority sırasıyla bütçeye ekle
+        for task in image_tasks:
+            idx = task[0]
+            img_bytes, title = results_by_index.get(idx, (None, ""))
+            if img_bytes:
+                if total_image_bytes + len(img_bytes) > MAX_TOTAL_IMAGE_BYTES:
+                    log.warning("Total image bytes limit exceeded. Skipping remaining images.")
+                    break
+                total_image_bytes += len(img_bytes)
+                cid = f"img{idx}"
+                cid_map[idx] = cid
+                titles_map[idx] = title
+                final_images.append((cid, img_bytes))
+
         # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
         raw_briefing = analyze_with_gemini(prompt)
         briefing_html = sanitize_gemini_html(raw_briefing)
 
+        # Görselleri enjekte et (token'ları img tag'i ile değiştir veya sil)
+        injected_html = inject_images(briefing_html, cid_map, titles_map)
+
         # Taşma bölümünü ekle (MAX_GEMINI_ARTICLES üzerindeki makaleler için)
         overflow_html = build_overflow_html(overflow_matches)
-        full_content = briefing_html + overflow_html
+        full_content = injected_html + overflow_html
 
         # E-posta gövdesini oluştur ve gönder
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", full_content)
         send_email(
             subject=f"🛡️ CTI Tehdit Brifing — {today}",
             html_body=email_body,
+            images=final_images
         )
         log.info("Threat briefing sent successfully.")
     else:
