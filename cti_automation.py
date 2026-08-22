@@ -1449,6 +1449,8 @@ def main() -> None:
         titles_map = {}
         total_image_bytes = 0
         final_images = []
+        eligible_count = 0
+        budget_exceeded = False
 
         # Priority sırasıyla, sadece Gemini'nin kullandığı indeksler için bütçeye ekle
         for task in image_tasks:
@@ -1457,14 +1459,24 @@ def main() -> None:
                 continue
             img_bytes, title = results_by_index.get(idx, (None, ""))
             if img_bytes:
+                eligible_count += 1
                 if total_image_bytes + len(img_bytes) > MAX_TOTAL_IMAGE_BYTES:
                     log.warning("Total image bytes limit exceeded. Skipping remaining images.")
+                    budget_exceeded = True
                     break
                 total_image_bytes += len(img_bytes)
                 cid = f"img{idx}"
                 cid_map[idx] = cid
                 titles_map[idx] = title
                 final_images.append((cid, img_bytes))
+
+        # Bütçe kullanımını gözlemlenebilir kıl — havuz genişledikten sonra bu
+        # bütçe artık gerçekten dolabiliyor, üretim loglarında görünür olmalı
+        log.info(
+            "Image budget: %d attached, %.1f KB / %.1f KB used%s",
+            len(final_images), total_image_bytes / 1024, MAX_TOTAL_IMAGE_BYTES / 1024,
+            " (budget exceeded — remaining skipped)" if budget_exceeded else "",
+        )
 
         # Görselleri enjekte et (token'ları img tag'i ile değiştir veya sil)
         injected_html = inject_images(briefing_html, cid_map, titles_map)
