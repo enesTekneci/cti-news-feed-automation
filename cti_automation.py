@@ -95,6 +95,14 @@ IMAGE_TARGET_WIDTH     = 1280        # 640px görüntüleme × 2 (retina)
 IMAGE_JPEG_QUALITY     = 85
 MAX_TOTAL_IMAGE_BYTES  = 5_000_000   # Tüm görsellerin toplam tavanı
 IMAGE_FETCH_TIMEOUT    = 8
+# Gemini isteğinin azami süresi (ms). google-genai'nin kendisi hiç timeout
+# koymuyor — yüksek yoğunlukta istek yanıtsız asılı kalabilir (20 dk+),
+# bu durumda script-içi retry/model-fallback mantığına HİÇ sıra gelmez
+# (istisna fırlamadığı için yakalanamaz). Bu sınır olmadan tek bir asılı
+# istek, GitHub Actions'ın 20 dk job timeout'una çarpıp brifingi iptal
+# ettirebilir (2026-08-22'de yaşandı). 90 sn: en yavaş gözlemlenen başarılı
+# yanıttan (~67 sn) belirgin geniş, ama sonsuz beklemeden çok kısa.
+GEMINI_REQUEST_TIMEOUT_MS = 90_000
 # Token matematiği (50 makale × ~900 token/makale ≈ 45K token):
 #   Günlük bütçe: 250K → %18 kullanım. TPM: tek istek/gün, aşım riski yok.
 #   Makale sayısı artarsa body_chars dinamik olarak kısılır (build_prompt içinde).
@@ -1049,7 +1057,13 @@ def analyze_with_gemini(prompt: str) -> str:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
 
-    client = genai.Client(api_key=api_key)
+    # http_options.timeout: istek yanıtsız asılı kalırsa (Google tarafında
+    # gerçekten yaşanıyor) bunu bir TimeoutError'a çevirir — böylece aşağıdaki
+    # retry/model-fallback döngüsü devreye girebilir
+    client = genai.Client(
+        api_key=api_key,
+        http_options=genai.types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS),
+    )
     last_error = None
     max_attempts = len(_TRANSIENT_BACKOFF) + 1  # model başına: 1 ilk + retry sayısı
 
