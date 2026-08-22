@@ -36,6 +36,39 @@ Sonuç: yoğun haber günlerinde çok sayıda görsel, sakin günlerde az
 sayıda — hiçbir sabit hedefe bağlı olmadan, gerçek içerik
 kullanılabilirliğiyle orantılı.
 
+### İkinci gözden geçirmede bulunan iki ek karar
+
+Spec ilk onaylandıktan sonra, uygulamaya geçmeden önce yapılan kritik
+bir tekrar gözden geçirmede (superpowers akışının "spec self-review"
+adımı) iki gerçek açık tespit edildi ve spec'e dahil edildi:
+
+1. **Bütçe israfı — "aynı konu" bloğuna düşen makaleler.** Kod, hangi
+   makalelerin görselinin indirilip **bütçeye ekleneceğine** Gemini'yi
+   hiç çağırmadan, sadece `top_matches` sırasına bakarak karar
+   veriyordu. Ama `SYSTEM_PROMPT` kuralına göre Gemini bazı haberleri
+   "aynı konu hakkında ek haber" bloğuna düşürüyor ve bu blokta hiç
+   `[[IMG:n]]` token'ı yazmıyor (doğrulandı — bkz. kod). Sonuç: o
+   makalenin görseli yine de indirilip işlenip maile ekleniyor ama
+   hiçbir yerde görüntülenmiyor — boşa giden bant genişliği, gerçekten
+   gösterilecek başka bir görsele gidebilecek bütçe payı, gereksiz
+   büyümüş mail boyutu. Havuz genişledikçe bu çakışma ihtimali de
+   artıyor.
+2. **Gereksiz sıralı (sequential) bekleme.** Görsel indirme/işleme
+   tamamı, Gemini çağrısından **önce** bitmesi bekleniyordu. Ama görsel
+   indirmenin Gemini'nin ürettiği metne hiçbir bağımlılığı yok (hangi
+   görselin nihayetinde kullanılacağı hariç — bkz. madde 1). İkisi de
+   bağımsız ağ bekleme süreleri; art arda değil, eşzamanlı
+   çalıştırılabilir.
+
+**Birleşik çözüm:** Görsel indirme, Gemini çağrısıyla **eşzamanlı**
+başlatılır (görsel indirme mevcut `ThreadPoolExecutor` içinde ana
+thread'de sürerken, Gemini çağrısı ayrı bir arka plan thread'inde
+bekletilir). Gemini döndükten sonra, ham çıktıda **gerçekten hangi
+`[[IMG:n]]` token'larının bulunduğu** bir regex ile tespit edilir;
+bütçe döngüsü yalnızca bu indekste görünen makaleler için harcama
+yapar. Duplicate'e düşen makalenin görseli paralellik için baştan
+indirilir ama hiçbir zaman eklenmez/bütçe yemez.
+
 ### Değerlendirilen ve reddedilen alternatifler
 
 - **Daha yüksek sabit sayı (örn. 25):** Aynı "keskin kalıp" sorununu
@@ -63,10 +96,30 @@ değil; public repo runner'ı 4 vCPU/16 GB RAM sağlıyor (GitHub'ın
 resmi spesifikasyonu); kod tabanında zaten RSS çekimi 10 worker,
 makale sayfası çekimi 8 worker kullanıyor — tutarlı bir desen.
 
-**Bütçe uygulama döngüsü değişmiyor.** `image_tasks` listesi zaten
-`top_matches`'ın önceliğine göre sıralı üretiliyor; `MAX_TOTAL_IMAGE_BYTES`
-aşıldığında döngü `break` ile durma davranışı olduğu gibi kalıyor —
-genişletilmiş havuza otomatik olarak uygulanıyor.
+**Gemini çağrısı ile eşzamanlı çalıştırma.** `analyze_with_gemini(prompt)`
+çağrısı `ThreadPoolExecutor(max_workers=1)` ile arka plana alınır;
+mevcut görsel indirme bloğu (kendi `ThreadPoolExecutor(max_workers=10)`'u
+ile) ana thread'de değişmeden çalışmaya devam eder. İkisi de bağımsız
+blocking I/O çağrıları olduğu için aralarında paylaşılan mutable state
+yok — thread-safety riski yok. Gemini'nin fırlattığı istisna
+`gemini_future.result()` çağrıldığında aynen yeniden fırlatılır; üst
+seviye hata yönetimi (main()'in `try/except` sarmalayıcısı) değişmeden
+çalışır.
+
+**Bütçe uygulama döngüsü — bir koşul eklendi.** `image_tasks` listesi
+zaten `top_matches`'ın önceliğine göre sıralı üretiliyor;
+`MAX_TOTAL_IMAGE_BYTES` aşıldığında döngü `break` ile durma davranışı
+aynen kalıyor. Yeni eklenen: döngüye girmeden önce
+`briefing_html` (sanitizasyon sonrası, `inject_images()`'a
+verilecek olan string) üzerinde `re.findall(r'\[\[IMG:(\d+)\]\]', ...)`
+ile Gemini'nin gerçekten hangi indeksler için token yazdığı çıkarılır
+(`used_indices`). Döngüde `if idx not in used_indices: continue` ile
+Gemini'nin token yazmadığı (duplicate bloğuna düşen) makaleler bütçe
+harcamadan ve ek olarak eklenmeden atlanır. Not: `sanitize_gemini_html()`
+`[[IMG:n]]` metnini değiştirmez (HTML özel karakteri içermiyor,
+`html.escape()`'ten etkilenmez) — bu yüzden post-sanitize string
+üzerinde arama yapmak güvenli ve `inject_images()`'ın zaten kullandığı
+string ile tutarlı.
 
 **Görselsiz makale davranışı değişmiyor.** Görsel adayı bulunamayan
 makale placeholder olmadan metin olarak kalır (mevcut tasarım kararı,
@@ -74,19 +127,20 @@ kapsam dışı bırakıldı — bilinçli tercih).
 
 ## Performans
 
-En kötü senaryo toplam süre tahmini:
+Görsel indirme artık Gemini çağrısıyla eşzamanlı olduğu için, en kötü
+senaryo toplam süre bu iki bileşenin **toplamı değil maksimumu** olur:
 
 | Bileşen | Süre |
 |---|---|
-| RSS + makale sayfası çekme | ~25 sn |
-| Görsel indirme (50 aday, 10 worker, 8 sn timeout) | ~40 sn |
-| Gemini analizi (2026-08-22 timeout düzeltmesiyle) | ~15.5 dk |
-| **Toplam** | **~17 dk** |
+| RSS + makale sayfası çekme (sıralı, öncesinde) | ~25 sn |
+| max(Görsel indirme ~40 sn, Gemini analizi ~15.5 dk) | ~15.5 dk |
+| **Toplam** | **~16 dk** |
 
-GitHub Actions'ın 20 dakikalık job timeout'unun altında kalıyor. Bu
-tahmin, tüm Gemini denemelerinin VE tüm görsel indirmelerinin aynı anda
-en kötü şekilde başarısız olmasını gerektiren, gerçekleşme ihtimali
-son derece düşük bir bileşik senaryodur.
+Önceki (sıralı) tasarıma göre ~1 dakikalık ek pay kazanılmış oldu.
+GitHub Actions'ın 20 dakikalık job timeout'unun altında, önceki
+tahminden daha rahat bir marjla. Bu tahmin hâlâ tüm Gemini
+denemelerinin en kötü şekilde başarısız olmasını gerektiren, gerçekleşme
+ihtimali düşük bir senaryodur.
 
 ## Güvenlik ve hata yönetimi
 
@@ -104,3 +158,12 @@ whitelist invariant kontrolü + mevcut bağımsız test paketinin
 GitHub Actions çalıştırmasında (`gh workflow run`) log'daki
 "Processing N candidate images..." satırının artık günlük eşleşme
 sayısına (10 sınırına değil) yakın çıktığının doğrulanması.
+
+Ek olarak, `used_indices` filtresi için özel bir bağımsız test yazılır:
+`[[IMG:1]]` içeren ama `[[IMG:2]]` içermeyen sahte bir `briefing_html`
+üzerinde, hem 1 hem 2 için indirilmiş görsel olsa bile yalnızca 1'in
+`final_images`/bütçeye eklendiği doğrulanır. `analyze_with_gemini`'nin
+arka plan thread'inde çalıştırılması, mock bir `time.sleep` içeren sahte
+fonksiyonla test edilip görsel indirmenin gerçekten eşzamanlı sürdüğü
+(toplam sürenin ikisinin toplamından değil maksimumundan az farkla
+eşleştiği) doğrulanır.
