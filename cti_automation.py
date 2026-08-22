@@ -89,7 +89,6 @@ MAX_GEMINI_ARTICLES = 50       # Gemini'ye gönderilecek maks makale sayısı
 MAX_BODY_CHARS      = 10_000   # Makale sayfasından çekilecek maks metin (versiyon çıkarma)
 GEMINI_BODY_CHARS   = 3_000    # Gemini prompt'una gönderilecek makale bağlamı
 MAX_PROMPT_TOKENS   = 100_000  # Toplam prompt token üst sınırı (TPM güvenlik payı)
-MAX_IMAGE_ARTICLES     = 10          # Görsel aranacak makale sayısı
 MAX_DOWNLOAD_BYTES     = 2_000_000   # İndirme tavanı (optimizasyon öncesi)
 IMAGE_TARGET_WIDTH     = 1280        # 640px görüntüleme × 2 (retina)
 IMAGE_JPEG_QUALITY     = 85
@@ -1404,9 +1403,10 @@ def main() -> None:
         if overflow_matches:
             log.info("Overflow: %d additional articles will be listed without AI analysis.", len(overflow_matches))
 
-        # Görselleri indir ve optimize et (sadece en kritik makaleler)
+        # Görselleri indir ve optimize et (Gemini'ye giden tüm makalelerde aranır —
+        # gerçek sınır MAX_TOTAL_IMAGE_BYTES, sabit makale sayısı değil)
         image_tasks = []
-        for i, a in enumerate(top_matches[:MAX_IMAGE_ARTICLES], 1):
+        for i, a in enumerate(top_matches, 1):
             url = a.get("image_candidate") or a.get("og_image")
             if url:
                 image_tasks.append((i, url, a.get("link", ""), a.get("title", "")))
@@ -1414,7 +1414,7 @@ def main() -> None:
         results_by_index = {}
         if image_tasks:
             log.info("Processing %d candidate images...", len(image_tasks))
-            with ThreadPoolExecutor(max_workers=5) as pool:
+            with ThreadPoolExecutor(max_workers=10) as pool:
                 future_to_idx = {
                     pool.submit(process_image, task[1], task[2]): task
                     for task in image_tasks
