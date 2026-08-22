@@ -1428,14 +1428,26 @@ def main() -> None:
                         log.warning("Image worker failed for %s: %s", task[1], e)
                         results_by_index[idx] = (None, task[3])
 
+        # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
+        raw_briefing = analyze_with_gemini(prompt)
+        briefing_html = sanitize_gemini_html(raw_briefing)
+
+        # Gemini'nin GERÇEKTEN token yazdığı indeksler — "aynı konu hakkında ek
+        # haber" bloğuna düşen makaleler [[IMG:n]] yazmaz, bu yüzden onların
+        # görseli indirilmiş olsa bile bütçeye/eke hiç girmemeli.
+        # sanitize_gemini_html() bu metni değiştirmez (HTML özel karakteri yok).
+        used_indices = {int(n) for n in re.findall(r"\[\[IMG:(\d+)\]\]", briefing_html)}
+
         cid_map = {}
         titles_map = {}
         total_image_bytes = 0
         final_images = []
 
-        # Priority sırasıyla bütçeye ekle
+        # Priority sırasıyla, sadece Gemini'nin kullandığı indeksler için bütçeye ekle
         for task in image_tasks:
             idx = task[0]
+            if idx not in used_indices:
+                continue
             img_bytes, title = results_by_index.get(idx, (None, ""))
             if img_bytes:
                 if total_image_bytes + len(img_bytes) > MAX_TOTAL_IMAGE_BYTES:
@@ -1446,10 +1458,6 @@ def main() -> None:
                 cid_map[idx] = cid
                 titles_map[idx] = title
                 final_images.append((cid, img_bytes))
-
-        # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
-        raw_briefing = analyze_with_gemini(prompt)
-        briefing_html = sanitize_gemini_html(raw_briefing)
 
         # Görselleri enjekte et (token'ları img tag'i ile değiştir veya sil)
         injected_html = inject_images(briefing_html, cid_map, titles_map)
