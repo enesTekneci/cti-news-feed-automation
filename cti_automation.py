@@ -1411,25 +1411,32 @@ def main() -> None:
             if url:
                 image_tasks.append((i, url, a.get("link", ""), a.get("title", "")))
 
+        # Gemini cagrisini arka plan thread'inde baslat -- gorsel indirme onun
+        # ciktisina bagimli degil (hangi gorselin kullanilacagi haric, o da
+        # asagida ayrica filtreleniyor), bu yuzden ikisi eszamanli surebilir
         results_by_index = {}
-        if image_tasks:
-            log.info("Processing %d candidate images...", len(image_tasks))
-            with ThreadPoolExecutor(max_workers=10) as pool:
-                future_to_idx = {
-                    pool.submit(process_image, task[1], task[2]): task
-                    for task in image_tasks
-                }
-                for future in as_completed(future_to_idx):
-                    task = future_to_idx[future]
-                    idx = task[0]
-                    try:
-                        results_by_index[idx] = (future.result(), task[3])
-                    except Exception as e:
-                        log.warning("Image worker failed for %s: %s", task[1], e)
-                        results_by_index[idx] = (None, task[3])
+        with ThreadPoolExecutor(max_workers=1) as gemini_pool:
+            gemini_future = gemini_pool.submit(analyze_with_gemini, prompt)
 
-        # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
-        raw_briefing = analyze_with_gemini(prompt)
+            if image_tasks:
+                log.info("Processing %d candidate images...", len(image_tasks))
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    future_to_idx = {
+                        pool.submit(process_image, task[1], task[2]): task
+                        for task in image_tasks
+                    }
+                    for future in as_completed(future_to_idx):
+                        task = future_to_idx[future]
+                        idx = task[0]
+                        try:
+                            results_by_index[idx] = (future.result(), task[3])
+                        except Exception as e:
+                            log.warning("Image worker failed for %s: %s", task[1], e)
+                            results_by_index[idx] = (None, task[3])
+
+            # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
+            raw_briefing = gemini_future.result()
+
         briefing_html = sanitize_gemini_html(raw_briefing)
 
         # Gemini'nin GERÇEKTEN token yazdığı indeksler — "aynı konu hakkında ek
