@@ -42,8 +42,11 @@ jobs:
   # ── Ana is: brifingi uret ve mail at ────────────────────────────────────
   briefing:
     runs-on: ubuntu-latest
-    # Takilirsa 20 dk sonra durdur (normalde ~2 dk surer)
-    timeout-minutes: 20
+    # Takilirsa durdur. 2026-08-27'de 20 dk'dan 30 dk'ya cikarildi: Gemini'nin
+    # 43 makalelik brifingi uretmesi olculdugunde ~280 sn suruyor ve script-ici
+    # toplam Gemini butcesi 15 dk. Feed cekme + gorsel isleme ile birlikte en
+    # kotu senaryo ~19 dk'ya ulasiyor, 20 dk'lik limit buna cok yakindi.
+    timeout-minutes: 30
 
     steps:
       - name: Repoyu indir

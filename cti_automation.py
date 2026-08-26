@@ -5,7 +5,7 @@ Fetches security RSS feeds, matches against product inventory,
 analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
 
 Çalışma akışı:
-  1. 66 RSS feed'ini paralel olarak çek
+  1. Tüm RSS feed'lerini paralel olarak çek (FEEDS listesi)
   2. Son 24 saatteki makaleleri filtrele
   3. Envanterdeki ürünlerle eşleşenleri bul
   4. En kritik makaleleri Gemini'ye gönder (limit: MAX_GEMINI_ARTICLES), derin analiz al
@@ -99,10 +99,22 @@ IMAGE_FETCH_TIMEOUT    = 8
 # koymuyor — yüksek yoğunlukta istek yanıtsız asılı kalabilir (20 dk+),
 # bu durumda script-içi retry/model-fallback mantığına HİÇ sıra gelmez
 # (istisna fırlamadığı için yakalanamaz). Bu sınır olmadan tek bir asılı
-# istek, GitHub Actions'ın 20 dk job timeout'una çarpıp brifingi iptal
-# ettirebilir (2026-08-22'de yaşandı). 90 sn: en yavaş gözlemlenen başarılı
-# yanıttan (~67 sn) belirgin geniş, ama sonsuz beklemeden çok kısa.
-GEMINI_REQUEST_TIMEOUT_MS = 90_000
+# istek, GitHub Actions'ın job timeout'una çarpıp brifingi iptal ettirebilir
+# (2026-08-22'de yaşandı).
+#
+# 2026-08-27: 90 sn'lik eski değer ÇOK DÜŞÜKTÜ ve brifingi tamamen düşürüyordu.
+# Ölçüm (43 makale, ~120 KB prompt, ~57 KB HTML çıktı):
+#     gemini-3.5-flash → 280,6 sn        gemini-2.5-flash → 133,3 sn
+# Yani model doğru çalışırken bile her istek 90 sn'de kesiliyor, üç model de
+# 504 veriyor ve "tüm modeller başarısız" hatasıyla mail hiç gitmiyordu.
+# 360 sn: ölçülen en yavaş yanıtın (~281 sn) belirgin üstünde, sonsuzdan uzak.
+GEMINI_REQUEST_TIMEOUT_MS = 360_000
+
+# Tüm model zincirinin (retry'lar dahil) toplam süre bütçesi (saniye).
+# Tek istek sınırını yükseltmek tek başına yetmez: 4 model × 3 deneme ×
+# 360 sn = 72 dakika eder ve job timeout'unu yine patlatır. Bu bütçe,
+# zincirin ne kadar uzarsa uzasın toplamda sınırlı kalmasını garanti eder.
+GEMINI_TOTAL_BUDGET_SEC = 900
 # Token matematiği (50 makale × ~900 token/makale ≈ 45K token):
 #   Günlük bütçe: 250K → %18 kullanım. TPM: tek istek/gün, aşım riski yok.
 #   Makale sayısı artarsa body_chars dinamik olarak kısılır (build_prompt içinde).
@@ -145,10 +157,25 @@ INVENTORY = _load_json_env("INVENTORY_JSON", "ürün envanteri")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  RSS FEEDS
-#  66 güvenlik haber/advisory kaynağı (her biri 10 worker ile paralel çekilir).
-#  Tier 1: Birincil CTI kaynakları (CERT, vendor PSIRT, ana medya)
-#  Tier 2: Destekleyici kaynaklar (haber siteleri, blog)
-#  Tier 3: Ek kaynaklar (USOM, ZDI, ransomware tracker vb.)
+#  Güvenlik haber/advisory kaynakları (her biri 10 worker ile paralel çekilir).
+#  Tier 1: Birincil CTI kaynakları (CERT, vendor PSIRT, CVE akışları)
+#  Tier 2: Destekleyici kaynaklar (araştırma blogları, exploit istihbaratı)
+#  Tier 3: Ek kaynaklar (haber siteleri, ZDI, ransomware tracker vb.)
+#
+#  BAKIM NOTU (2026-08-27): Tüm liste canlı olarak taranıp doğrulandı.
+#  Yanıt vermeyen 16 kaynak çıkarıldı (NVD RSS 404'e düştü, GitHub Advisory
+#  aynası bozuldu, USOM RSS'i HTML'e yönlendiriyor, SolarWinds/MSRC Blog/
+#  Palo Alto legacy adresleri kapandı, feeds.fortinet.com sertifikası geçersiz).
+#  Yerlerine envanterdeki vendor'ları kapsayan 27 doğrulanmış kaynak eklendi.
+#  Yeni kaynak eklemeden ÖNCE canlı olarak test et: URL'in entry döndürmesi
+#  YETMEZ, fetch_feed() üzerinden (bu UA ve timeout ile) test edilmeli —
+#  bazı siteler feedparser'ın kendi UA'sına içerik verip bize vermiyor.
+#
+#  Bazı büyük vendor'ların artık çalışan bir RSS ucu YOK (advisory'lerini
+#  yalnızca web portalından yayınlıyorlar veya bot isteklerini engelliyorlar).
+#  Bu boşluk NCSC-NL, BSI CERT-Bund, CISA, cvefeed ve VulDB gibi vendor-üstü
+#  kaynaklar üzerinden dolaylı olarak kapanıyor — o vendor'lar için ayrı bir
+#  kaynak aramaya gerek yok, aramadan önce bu satırı hatırla.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 FEEDS = [
@@ -164,61 +191,79 @@ FEEDS = [
     ("Cloudflare Security", "https://blog.cloudflare.com/tag/security/rss"),
     ("CrowdStrike", "https://crowdstrike.com/blog/feed"),
     ("EclecticIQ", "https://blog.eclecticiq.com/rss.xml"),
-    ("Fortinet Threat Research", "https://feeds.fortinet.com/fortinet/blog/threat-research"),
     ("Fortinet PSIRT", "https://filestore.fortinet.com/fortiguard/rss/ir.xml"),
     ("Google Project Zero", "https://googleprojectzero.blogspot.com/feeds/posts/default"),
     ("Krebs on Security", "https://krebsonsecurity.com/feed"),
     ("Microsoft MSRC Update Guide", "https://api.msrc.microsoft.com/update-guide/rss"),
     ("Microsoft Security Blog", "https://microsoft.com/en-us/security/blog/feed"),
     ("NCSC UK", "https://www.ncsc.gov.uk/api/1/services/v1/all-rss-feed.xml"),
-    ("NVD Recent CVEs", "https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss.xml"),
+    # NVD kendi RSS uçlarını kapattı (404) — yerine cvefeed.io ve VulDB akışları
+    ("CVE Feed — Son CVE'ler", "https://cvefeed.io/rssfeed/latest.xml"),
+    ("CVE Feed — Yüksek/Kritik", "https://cvefeed.io/rssfeed/severity/high.xml"),
+    ("VulDB Son Zafiyetler", "https://vuldb.com/?rss.recent"),
     ("Palo Alto Security Advisories", "https://security.paloaltonetworks.com/rss.xml"),
     ("Palo Alto Unit 42", "https://unit42.paloaltonetworks.com/feed"),
     ("Recorded Future", "https://www.recordedfuture.com/feed"),
     ("SANS ISC", "https://isc.sans.edu/rssfeed_full.xml"),
     ("Securelist (Kaspersky)", "https://securelist.com/feed"),
-    ("SolarWinds Security Advisories", "https://www.solarwinds.com/shared-content/rss-feed/solarwinds-cve-rss-feed"),
     ("SOCRadar", "https://socradar.io/feed/"),
     ("The Record by Recorded Future", "https://therecord.media/feed"),
     ("Veeam Security Advisories", "https://www.veeam.com/services/open/kb/security-feed"),
+    # ── Envanterdeki vendor'lar için eklenen PSIRT/CERT kaynakları ──
+    ("Red Hat Product Security", "https://www.redhat.com/en/rss/blog/channel/security"),
+    ("Ubuntu Security Notices", "https://ubuntu.com/security/notices/rss.xml"),
+    ("Debian Security Advisories", "https://www.debian.org/security/dsa-long"),
+    ("Google Cloud Security Bulletins", "https://cloud.google.com/feeds/google-cloud-security-bulletins.xml"),
+    ("Chrome Releases", "https://chromereleases.googleblog.com/feeds/posts/default"),
+    ("VMware Security (Broadcom)", "https://blogs.vmware.com/security/feed"),
+    ("CISA ICS Advisories", "https://www.cisa.gov/cybersecurity-advisories/ics-advisories.xml"),
+    ("NCSC-NL Advisories", "https://advisories.ncsc.nl/rss/advisories"),
+    ("CERT-FR Avis", "https://www.cert.ssi.gouv.fr/avis/feed/"),
     # Tier 2: Supporting Sources
     ("Bitdefender Labs", "https://bitdefender.com/blog/api/rss/labs"),
     ("Bleeping Computer", "https://www.bleepingcomputer.com/feed/"),
     ("Broadcom/Symantec Blog", "https://sed-cms.broadcom.com/rss/v1/blogs/rss.xml"),
     ("BSI CERT-Bund", "https://wid.cert-bund.de/content/public/securityAdvisory/rss"),
-    ("Cybersecurity News", "https://cybersecuritynews.com/feed/"),
     ("Infosecurity Magazine", "https://infosecurity-magazine.com/rss/news"),
     ("JPCERT/CC", "http://jvndb.jvn.jp/en/rss/jvndb_new.rdf"),
     ("Malwarebytes Labs", "https://blog.malwarebytes.com/feed"),
     ("Maryland MCAC Cyber Threats", "https://mcac.maryland.gov/tag/cyber-threats/feed"),
-    ("Microsoft MSRC Blog", "https://msrc.microsoft.com/blog/feed"),
     ("NIST Cybersecurity Insights", "https://nist.gov/blogs/cybersecurity-insights/rss.xml"),
     ("Security Affairs", "https://securityaffairs.co/feed"),
     ("SentinelOne", "https://sentinelone.com/feed"),
     ("SOC Prime", "https://socprime.com/feed"),
     ("The Hacker News", "https://thehackernews.com/feeds/posts/default"),
     ("Wired", "https://www.wired.com/feed/category/security/latest/rss"),
+    # ── Exploit/zafiyet araştırma blogları (envanterdeki edge cihazlara odaklı) ──
+    ("watchTowr Labs", "https://labs.watchtowr.com/rss/"),
+    ("Horizon3.ai", "https://horizon3.ai/feed/"),
+    ("Check Point Research", "https://research.checkpoint.com/feed/"),
+    ("Rapid7 Blog", "https://blog.rapid7.com/rss/"),
+    ("Qualys Blog", "https://blog.qualys.com/feed"),
+    ("Tenable Blog", "https://www.tenable.com/blog/feed"),
+    ("GreyNoise Blog", "https://www.greynoise.io/blog/rss.xml"),
+    ("Exploit-DB", "https://www.exploit-db.com/rss.xml"),
+    # ── Ürün-özel kaynaklar (SAP, WordPress, Sophos, PHP envanterde var) ──
+    ("Onapsis (SAP Güvenliği)", "https://onapsis.com/feed/"),
+    ("SecurityBridge (SAP)", "https://securitybridge.com/feed/"),
+    ("Wordfence (WordPress)", "https://www.wordfence.com/feed/"),
+    ("PHP Releases", "https://www.php.net/feed.atom"),
+    ("Sophos News", "https://news.sophos.com/en-us/category/security-operations/feed/"),
+    # The Register (theregister.com/security/headlines.atom) aday olarak
+    # denendi ama eklenmedi: her istemciye XML yerine HTML sayfası dönüyor.
     # Tier 3: Ek kaynaklar
     ("Cisco Event Responses", "https://sec.cloudapps.cisco.com/security/center/eventResponses_20.xml"),
     ("Cisco Talos (FeedBurner)", "http://feeds.feedburner.com/feedburner/Talos"),
     ("DFIR Report", "https://thedfirreport.com/feed/"),
     ("FortiGuard PSIRT", "https://fortiguard.fortinet.com/rss/ir.xml"),
-    ("GitHub Advisory — npm", "https://azu.github.io/github-advisory-database-rss/npm.json"),
-    ("GitHub Advisory — pip", "https://azu.github.io/github-advisory-database-rss/pip.json"),
-    ("GitHub Advisory — Maven", "https://azu.github.io/github-advisory-database-rss/maven.json"),
-    ("GitHub Advisory — Go", "https://azu.github.io/github-advisory-database-rss/go.json"),
-    ("Infostealers", "https://www.infostealers.com/rss-feed/"),
-    ("NVD Analyzed CVEs", "https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss-analyzed.xml"),
-    ("Palo Alto Security Advisories (legacy)", "http://securityadvisories.paloaltonetworks.com/"),
     ("Ransomware Live", "https://www.ransomware.live/rss"),
     ("Red Canary", "https://redcanary.com/blog/feed/"),
-    ("Red Hat Security Advisories", "https://access.redhat.com/security/data/rhsa.rss"),
     ("SentinelOne Labs", "https://www.sentinelone.com/labs/feed/"),
     ("Recorded Future (FeedBurner)", "https://feeds.feedburner.com/threatintelligence/pvexyqv7v0v"),
     ("Unit 42 Threat Research", "https://unit42.paloaltonetworks.com/category/threat-research/feed/"),
-    ("USOM Duyurular", "https://www.usom.gov.tr/rss/duyuru.rss"),
-    ("USOM Tehditler", "https://www.usom.gov.tr/rss/tehdit.rss"),
-    ("USOM Zararlı Bağlantılar", "https://www.usom.gov.tr/rss/zararli-baglanti.rss"),
+    ("Dark Reading", "https://www.darkreading.com/rss.xml"),
+    ("SecurityWeek", "https://feeds.feedburner.com/securityweek"),
+    ("Help Net Security", "https://www.helpnetsecurity.com/feed/"),
     ("ZDI Upcoming Advisories", "https://www.zerodayinitiative.com/rss/upcoming/"),
     ("ZDI Published Advisories", "https://www.zerodayinitiative.com/rss/published/"),
 ]
@@ -228,8 +273,9 @@ FEEDS = [
 #  HIGH_SIGNAL: Bir makalenin güvenlik haberi olarak değerlendirilmesi için
 #               içermesi GEREKEN kelime listesi (en az 1 tane).
 #               Gürültüyü azaltır — sadece kritik güvenlik haberleri geçer.
-#  VENDOR_ALIASES: Ürünün alternatif/kısa adları (örn. "Apache HTTP Server"
-#                  ← "apache httpd"). Envanterde olmayan alias'lar atlandı.
+#  VENDOR_ALIASES: Ürünün alternatif/kısa adları (bir ürünün ticari adı ile
+#                  advisory'lerde geçen kısa adı farklı olabiliyor).
+#                  Envanterde olmayan vendor'ların alias'ları devreye girmez.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 HIGH_SIGNAL = [
@@ -247,7 +293,69 @@ HIGH_SIGNAL = [
     "arbitrary code execution",
     "security advisory", "security bulletin",
     "patch tuesday", "emergency patch",
+    # ── İngilizce dışı kaynaklar için sinyal kelimeleri ──────────────────
+    # BSI CERT-Bund (DE, 250 entry/gün), CERT-FR (FR) ve JPCERT gibi
+    # kaynaklar İngilizce başlık kullanmıyor; bu kelimeler olmadan bu
+    # feed'lerin TAMAMI HIGH_SIGNAL süzgecinde eleniyordu.
+    "schwachstelle", "schwachstellen", "sicherheitslücke", "sicherheitsupdate",
+    "sicherheitsanfälligkeit", "ausnutzung",
+    "vulnérabilité", "vulnérabilités", "faille de sécurité", "correctif de sécurité",
+    "zafiyet", "güvenlik açığı", "kritik açık", "istismar",
 ]
+
+# ── Gürültü süzgeci (başlıkta aranır) ───────────────────────────────
+# Pazarlama/etkinlik içeriği HIGH_SIGNAL kelimelerini taşıyabiliyor
+# (örn. "Webinar: Defending Against Ransomware"). Bunlar brifingde
+# yer kaplayıp gerçek advisory'leri MAX_GEMINI_ARTICLES limitinden
+# dışarı itiyor. Sadece BAŞLIKTA aranır — makale gövdesinde "webinar"
+# geçmesi haberi gürültü yapmaz.
+NOISE_TITLE_PATTERNS = [
+    "webinar", "podcast", "on-demand demo", "register now", "register today",
+    "sponsored", "sponsored content", "whitepaper", "white paper", "e-book",
+    "ebook", "join us", "watch the replay", "we're hiring", "we are hiring",
+    "press release", "customer story", "case study", "magic quadrant",
+    "forrester wave", "product launch", "now generally available",
+    "sign up for", "save the date", "meet us at", "recap:",
+]
+
+
+def _keyword_pattern(keyword: str) -> str:
+    """Bir HIGH_SIGNAL kelimesi için kelime-sınırlı regex parçası üret.
+
+    Neden gerekli: eskiden eşleştirme düz alt-dize (`kw in text`) ile
+    yapılıyordu ve "rce" kelimesi "source", "resource", "workforce"
+    içinde eşleşiyordu. Bu, İÇİNDE "open source" geçen HER makaleye
+    RCE'nin 3 puanını veriyor, önceliklendirmeyi bozuyordu.
+
+    "cve-" gibi tire ile biten önekler sağ sınır ALMAZ — aksi halde
+    "cve-2026" eşleşmez (tireden sonra rakam gelir).
+    """
+    escaped = re.escape(keyword)
+    left = r"(?<![0-9A-Za-zÀ-ÿ])"
+    right = "" if keyword.endswith("-") else r"(?![0-9A-Za-zÀ-ÿ])"
+    return f"{left}{escaped}{right}"
+
+
+# Uzun kelimeler önce denensin ("poc exploit" < "proof of concept exploit")
+_HIGH_SIGNAL_RE = re.compile(
+    "|".join(_keyword_pattern(k) for k in sorted(HIGH_SIGNAL, key=len, reverse=True)),
+    re.IGNORECASE,
+)
+
+_NOISE_TITLE_RE = re.compile(
+    "|".join(_keyword_pattern(k) for k in NOISE_TITLE_PATTERNS),
+    re.IGNORECASE,
+)
+
+# CVE numarası (dedup ve puanlama için)
+_CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+
+# "CVSS 9.8", "CVSSv3 Score: 9.1", "Severity: 8.8 | HIGH", "base score of 10.0"
+_CVSS_SCORE_RE = re.compile(
+    r"(?:cvss(?:v\d(?:\.\d)?)?\s*(?:score|rating|base\s+score)?\s*[:of]{0,3}\s*"
+    r"|base\s+score\s*[:of]{0,3}\s*|severity\s*:\s*)(\d{1,2}(?:\.\d)?)",
+    re.IGNORECASE,
+)
 
 # ── Önceliklendirme puanlama tablosu ────────────────
 # Kritik (3 puan): aktif sömürü, zero-day, RCE
@@ -264,21 +372,68 @@ _SIGNAL_SCORES: dict[str, int] = {
 }
 _DEFAULT_SIGNAL_SCORE = 1  # HIGH_SIGNAL'da olup tabloda olmayan keyword'ler
 
+# Bağlamsal bonuslar — kelime sayısı tek başına önceliği iyi belirlemiyordu
+_TITLE_MATCH_BONUS = 3   # Ürün adı BAŞLIKTA geçiyorsa haber gerçekten o ürünle ilgili
+_CVE_PRESENT_BONUS = 2   # Somut bir CVE var → advisory, spekülasyon değil
+_CVSS_CRITICAL_BONUS = 4  # CVSS >= 9.0
+_CVSS_HIGH_BONUS = 2      # CVSS 7.0 – 8.9
 
-def score_article(text: str) -> int:
-    """Makale metnine göre öncelik puanı hesapla (yüksek = daha kritik).
+
+def has_high_signal(text: str) -> bool:
+    """Metin en az bir HIGH_SIGNAL kelimesi içeriyor mu? (kelime sınırlı)"""
+    return _HIGH_SIGNAL_RE.search(text) is not None
+
+
+def max_cvss(text: str) -> float:
+    """Metindeki en yüksek CVSS puanını döndür (bulunamazsa 0.0).
+
+    Öncelik sıralamasında kullanılır: CVSS 9.8'lik bir advisory,
+    aynı kelimeleri içeren CVSS 4.0'lık bir advisory'nin önüne geçmeli.
+    """
+    best = 0.0
+    for m in _CVSS_SCORE_RE.finditer(text):
+        try:
+            score = float(m.group(1))
+        except ValueError:
+            continue
+        if 0.0 < score <= 10.0:
+            best = max(best, score)
+    return best
+
+
+def score_article(text: str, title: str = "", matched_product: str = "") -> int:
+    """Makaleye öncelik puanı hesapla (yüksek = daha kritik).
 
     Bu puan MAX_GEMINI_ARTICLES limitinde önceliği belirler: en kritik
     makaleler Gemini'ye gider, geri kalanı taşma tablosunda gösterilir.
+
+    Puan bileşenleri:
+      1. HIGH_SIGNAL kelimeleri (kelime sınırlı — her kelime bir kez sayılır)
+      2. Ürün adı başlıkta mı? (gövdede tek geçiş zayıf sinyaldir)
+      3. Somut CVE var mı?
+      4. CVSS taban puanı
     """
     total = 0
-    for kw in HIGH_SIGNAL:
-        if kw in text:
-            total += _SIGNAL_SCORES.get(kw, _DEFAULT_SIGNAL_SCORE)
+    # set(): aynı kelimenin 10 kez geçmesi puanı 10'a katlamasın
+    for hit in {h.lower() for h in _HIGH_SIGNAL_RE.findall(text)}:
+        total += _SIGNAL_SCORES.get(hit, _DEFAULT_SIGNAL_SCORE)
+
+    if matched_product and title and matched_product in norm(title):
+        total += _TITLE_MATCH_BONUS
+
+    if _CVE_RE.search(text):
+        total += _CVE_PRESENT_BONUS
+
+    cvss = max_cvss(text)
+    if cvss >= 9.0:
+        total += _CVSS_CRITICAL_BONUS
+    elif cvss >= 7.0:
+        total += _CVSS_HIGH_BONUS
+
     return total
 
 # Alias matching iki aşamalı çalışır:
-# 1) vendor_key envanter ürün adında geçiyor mu? (örn. "cisco" → "cisco 1921")
+# 1) vendor_key envanter ürün adlarından birinde geçiyor mu?
 # 2) Geçiyorsa o vendor'un alias'ları aktif olur
 # Böylece kullanmadığın vendor'un alias'ları false positive üretmez.
 VENDOR_ALIASES = _load_json_env("VENDOR_ALIASES_JSON", "vendor alias eşleştirme tablosu")
@@ -318,7 +473,7 @@ KURALLAR:
 - Yanıtın tamamı TÜRKÇE olmalı. Teknik terimler, CVE numaraları, ürün isimleri ve komutlar İNGİLİZCE kalmalı.
 - Giriş veya sonuç cümlesi YAZMA. Doğrudan ilk brifing bloğuyla başla.
 - "Özet" 25 kelimeyi geçmemeli.
-- "Özet" içinde zafiyetin istismar edildiği, keşfedildiği veya olayın gerçekleştiği SPESİFİK bir tarih geçiyorsa (bu, haberin yayın tarihi DEĞİL — o "Haber Tarihi" alanında zaten var; burası olayın/istismarın kendi tarihi), bu tarihi <strong style="color:#0d6efd;">...</strong> ile vurgula. Örnek: "Zafiyet <strong style=\"color:#0d6efd;\">15 Ağustos 2026</strong>'dan beri aktif istismar ediliyor." Böyle bir tarih geçmiyorsa bu kuralı uygulama, tarih uydurma.
+- "Özet" içinde zafiyetin istismar edildiği, keşfedildiği veya olayın gerçekleştiği SPESİFİK bir tarih geçiyorsa (bu, haberin yayın tarihi DEĞİL — o "Haber Tarihi" alanında zaten var; burası olayın/istismarın kendi tarihi), bu tarihi <span style="color:#0d6efd;">...</span> ile SADECE RENKLİ yaz. KALIN YAPMA — <strong> veya <b> KULLANMA. Örnek: "Zafiyet <span style=\"color:#0d6efd;\">15 Ağustos 2026</span>'dan beri aktif istismar ediliyor." Böyle bir tarih geçmiyorsa bu kuralı uygulama, tarih uydurma.
 - "Aksiyon" imperatif ve doğrudan olmalı. Spesifik bir aksiyon yoksa: "Güncellemeleri takip et."
 - Her brifing bloğunda <h3> başlığının hemen altına tam olarak [[IMG:n]] yaz (n, o makalenin sana verilen numarasıdır, örneğin [[IMG:1]]). Görseli olsa da olmasa da bu token'ı mutlaka ekle.
 - Eğer iki haber aynı CVE veya olayı işliyorsa, ikincisi için yalnızca şunu yaz:
@@ -329,8 +484,16 @@ KURALLAR:
     </p>
   </div>
 - Her haberde "Full Article Content" ve "Detected Versions" alanları verilmiştir. Versiyon bilgisini doldururken bu verileri DİKKATLİCE analiz et:
-  * "Etkilenen Sürümler" alanına YALNIZCA zafiyetten etkilenen (savunmasız) versiyonları yaz. "< 12.1.4-h5" ifadesi "12.1.4-h5'ten önceki tüm sürümler etkileniyor" demektir. Ürün adıyla birlikte yaz (örn. "PAN-OS 11.2.0 – 11.2.4-h16", "FortiOS < 7.4.7").
-  * "Yamalı Sürümler" alanına yamayı/düzeltmeyi içeren güvenli sürümleri yaz. ">= 12.1.4-h5" veya "fixed in 7.4.7" ifadesi yamalı sürümdür. Yükseltme hedefi olarak göster (örn. "PAN-OS >= 11.2.4-h17", "FortiOS 7.4.7 veya üzeri").
+  * "Detected Versions" listesindeki işaretler ANLAM taşır, bunları doğru yorumla:
+      "11.2.0 – 11.2.4-h16" = bu aralıktaki sürümler ETKİLENİYOR
+      "< 9.0.98"            = bu sürümden ÖNCEKİ her şey ETKİLENİYOR
+      "<= 20.1.0"           = bu sürüm DAHİL ve öncesi ETKİLENİYOR
+      ">= 7.4.7"            = bu sürüm ve sonrası GÜVENLİ (yamalı)
+      "fixed in 1.38.3"     = yamayı içeren sürüm, YÜKSELTME HEDEFİ
+      "11.2.x"              = o dalın tüm alt sürümleri
+      "KB5031354"           = Microsoft yama kimliği (sürüm yerine bunu yaz)
+  * "Etkilenen Sürümler" alanına YALNIZCA zafiyetten etkilenen (savunmasız) versiyonları yaz. Ürün adıyla birlikte yaz (örn. "PAN-OS 11.2.0 – 11.2.4-h16", "FortiOS < 7.4.7").
+  * "Yamalı Sürümler" alanına yamayı/düzeltmeyi içeren güvenli sürümleri yaz. Yükseltme hedefi olarak göster (örn. "PAN-OS >= 11.2.4-h17", "FortiOS 7.4.7 veya üzeri", "Windows: KB5031354").
   * Birden fazla ürün dalı (branch) etkileniyorsa her dalı ayrı ayrı listele.
   * "Affected/Unaffected" veya "before/prior to" gibi bağlamsal ipuçlarına dikkat et.
   * Haberde hiçbir versiyon bilgisi gerçekten yoksa her iki alan için de "Belirtilmemiş — kaynağı kontrol edin" yaz.
@@ -347,9 +510,19 @@ _HTML_TAG = re.compile(r"<[^>]*>")
 _WHITESPACE = re.compile(r"\s+")
 
 
-def strip_html(html: str) -> str:
-    """HTML tag'lerini çıkar ve fazla boşlukları tek boşluğa indirge."""
-    return _WHITESPACE.sub(" ", _HTML_TAG.sub(" ", html or "")).strip()
+def strip_html(raw: str) -> str:
+    """HTML tag'lerini çıkar, entity'leri çöz, boşlukları tek boşluğa indirge.
+
+    Entity çözümü versiyon çıkarma için KRİTİK: CISA/vendor advisory'leri
+    sürüm eşiklerini "&lt;=20.1.0" veya "&lt;4.3.4.1" olarak yayınlıyor.
+    Entity çözülmezse regex'in gördüğü metin "&lt;=20.1.0" olur, "<=" ile
+    başlayan hiçbir desen eşleşmez ve "etkilenen sürüm" bilgisi kaybolur.
+
+    Sıra önemli: ÖNCE tag'ler silinir, SONRA entity çözülür. Ters sırada
+    "&lt;script&gt;" gerçek bir <script> tag'ine dönüşür ve temizlenmeden
+    metne karışırdı.
+    """
+    return _WHITESPACE.sub(" ", html.unescape(_HTML_TAG.sub(" ", raw or ""))).strip()
 
 
 def norm(s: str) -> str:
@@ -357,38 +530,88 @@ def norm(s: str) -> str:
     return _WHITESPACE.sub(" ", (s or "").lower()).strip()
 
 
-# Versiyon numaralarını yakalayan regex desenleri
+# ── Versiyon çıkarma ────────────────────────────────────────────────
+# Desenler canlı advisory metinleri (Fortinet/Cisco/Palo Alto PSIRT, CISA,
+# Ubuntu USN, Dell, cvefeed) taranarak çıkarıldı — tahminle değil.
+#
 # Build/patch soneki: "-h5", "-h16-rc1" gibi. Tire sonrası HARF şartı var, bu yüzden
 # "7.0-7.6" gibi aralık ayırıcısı tire ile KARIŞMAZ (7 bir harf değil, sayı).
 _BUILD_SUFFIX = r"(?:-[a-zA-Z]+\d*)*"
 
+# İki bileşenli sürüm (7.4). YALNIZCA bir anahtar kelime bağlam verdiğinde
+# kullanılır ("versions 7.4 and earlier") — tek başına aranırsa CVSS puanları
+# (8.8, 9.1) ve tablo hücreleri sürüm sanılır.
+_VER_LOOSE = rf"\d+\.\d+(?:\.(?:\d+|[xX*]))*{_BUILD_SUFFIX}"
+# Üç+ bileşenli sürüm (7.4.2, 7.00.00.182, 7.4.x). Bağlamsız da güvenli.
+_VER_STRICT = rf"\d+\.\d+(?:\.(?:\d+|[xX*]))+{_BUILD_SUFFIX}"
+
+# NOT: Alternatif sırası ÖNEMLİ. Regex aynı konumda soldaki dalı seçer;
+# bu yüzden anlamı zenginleştiren dallar ("... and earlier", "fixed in ...")
+# sade "version X" dalından ÖNCE gelmeli. Aksi halde "versions 20.2 and prior"
+# ifadesinde sade dal "20.2"yi yutar ve "≤" anlamı kaybolur (eski davranış).
 _VERSION_RE = re.compile(
     rf"""
-    # "version 7.4.2", "ver 3.1.0", "v2.0.1"
-    (?:versions?\s*:?\s*|ver\.?\s*|[Vv])(\d+\.\d+(?:\.\d+)+(?:[a-z0-9._-]*)?)
+    # ①a "between 7.0.0 and 7.4.2" / "from 2.4.17 through 2.4.67"
+    #     "and" ayıracı YALNIZCA between/from öneki varken geçerli — aksi
+    #     halde "affects 1.2.3 and 4.5.6" gibi bir LİSTE aralık sanılırdı.
+    (?:between|from)\s+({_VER_LOOSE})\s*(?:and|through|thru|to|–|—|-)\s*({_VER_LOOSE})
     |
-    # "FortiOS 7.0.0 through 7.4.2", "7.0 – 7.6" — her iki uç da build soneki alabilir
-    # (örn. "12.1.2 through 12.1.4-h*" gibi Palo Alto tablo formatı)
-    (\d+\.\d+(?:\.\d+)*{_BUILD_SUFFIX})\s*(?:through|thru|to|–|—|-)\s*(\d+\.\d+(?:\.\d+)*{_BUILD_SUFFIX})
+    # ①b "versions 1.3.0 - 1.3.6", "7.0.0 through 7.4.2", "12.1.2 through 12.1.4-h*"
+    #     "versions?" öneki bu dala dahil — aksi halde sade dal (⑦) önce
+    #     eşleşip aralığın sol ucunu yutuyor, sağ ucu kayboluyordu.
+    (?:versions?\s+)?({_VER_LOOSE})\s*(?:through|thru|to|–|—|-)\s*({_VER_LOOSE})
     |
-    # "before 9.0.98", "prior to version 10.2.1", "earlier than 7.6.3", "< 3.1.0", "<= 12.1.4-h5"
-    (?:before|prior\s+to|earlier\s+than|<=?)\s*(?:version\s+)?(\d+\.\d+(?:\.\d+)+{_BUILD_SUFFIX})
+    # ② "X and earlier / and below / and prior / or older" → üst sınır
+    #    Dell, cvefeed ve CISA advisory'lerinde EN SIK görülen kalıp.
+    (?:versions?\s+)?({_VER_LOOSE})\s*(?:and|or)\s+(?:earlier|below|prior|older|lower)
     |
-    # ">= 12.1.4-h5", "> 7.4.6" — yamalı/güvenli sürüm eşiği (PSIRT tablolarında sık görülür)
-    >=?\s*(?:version\s+)?(\d+\.\d+(?:\.\d+)+{_BUILD_SUFFIX})
+    # ③ "X and later / or above / and newer" → yamalı sürüm eşiği
+    (?:versions?\s+)?({_VER_LOOSE})\s*(?:and|or)\s+(?:later|above|newer|higher)
     |
-    # Ürün adından/etiketten sonra gelen bağımsız versiyon: "FortiOS 7.4.2",
-    # "fixed in 7.4.7", "Affected: 11.1.4-h33" (iki nokta üst üste de tetikler)
-    (?<=[A-Za-z:]\s)(\d+\.\d+\.\d+(?:\.\d+)*(?:[a-z0-9._-]*)?)
+    # ④ "fixed in 7.4.7", "upgrade to 1.38.3", "resolved in 12.1.4-h5"
+    (?:fixed\s+in|resolved\s+in|patched\s+in|addressed\s+in|remediated\s+in
+      |upgrad(?:e|ing)\s+to|updat(?:e|ing)\s+to)
+    \s+(?:version\s+)?({_VER_LOOSE})
+    |
+    # ⑤ "before 9.0.98", "prior to version 10.2.1", "earlier than 7.6.3",
+    #    "up to 3.1.0", "< 3.1.0", "<= 12.1.4-h5"  → üst sınır
+    (?:before|prior\s+to|earlier\s+than|older\s+than|up\s+to(?:\s+and\s+including)?|<=?)
+    \s*(?:versions?\s+)?({_VER_LOOSE})
+    |
+    # ⑥ ">= 12.1.4-h5", "> 7.4.6" — yamalı/güvenli sürüm eşiği
+    >=?\s*(?:versions?\s+)?({_VER_LOOSE})
+    |
+    # ⑦ "version 7.4.2", "ver 3.1.0", "v2.0.1"
+    #    (?<!cvss\s): "CVSS Version 3.1" tablo başlığını sürüm sanmasın.
+    (?<!cvss\s)(?:versions?\s*:?\s*|ver\.?\s*|[Vv])({_VER_STRICT})
+    |
+    # ⑧ Ürün adından/etiketten sonra bağımsız sürüm: "FortiOS 7.4.2",
+    #    "PAN-OS 11.2.x", "Affected: 11.1.4-h33" (iki nokta da tetikler)
+    (?<=[A-Za-z:]\s)({_VER_STRICT})
+    |
+    # ⑨ Microsoft KB numarası — Microsoft ürünlerinde yamanın kimliği
+    #    sürüm numarası değil KB numarasıdır.
+    (KB\d{{6,8}})
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-# Yanlış pozitif versiyonları filtrele (tarihler, CVE numaraları vb.)
+# Yanlış pozitif versiyonları filtrele (tarihler, CVE numaraları, özel IP'ler)
 _FALSE_VERSION_RE = re.compile(
-    r"^(?:20[012]\d\.\d|CVE-|CWE-|19\d\d\.|0\.0\.0$)",
-    re.IGNORECASE,
+    r"""^(?:
+        20[0-4]\d\.\d          # tarih benzeri: 2026.8
+      | 19\d\d\.               # 1999.x
+      | CVE- | CWE- | CVSS
+      | 0\.0\.0$               # anlamsız
+      | 10\.0\.0\.\d           # özel IP bloğu 10.0.0.x
+      | 192\.168\.             # özel IP bloğu
+      | 172\.(?:1[6-9]|2\d|3[01])\.   # özel IP bloğu
+      | 127\.0\.0\.1$
+    )""",
+    re.IGNORECASE | re.VERBOSE,
 )
+
+MAX_VERSIONS = 40  # Tek makaleden çıkarılacak azami sürüm (prompt şişmesin)
 
 
 def extract_versions(text: str) -> list[str]:
@@ -397,29 +620,47 @@ def extract_versions(text: str) -> list[str]:
     Gemini'ye "Detected Versions" alanı olarak ayrı bir liste verilir,
     böylece model versiyonları kaçırmaz. Tam article body (MAX_BODY_CHARS)
     üzerinden çalışır.
+
+    Çıktı sürümün ANLAMINI da taşır — Gemini "Etkilenen" ile "Yamalı"
+    sürümleri ayırabilsin diye:
+      "7.0.0 – 7.4.2"    aralık
+      "<= 20.1.0"        bu sürüm ve öncesi etkilenir
+      ">= 7.4.7"         bu sürüm ve sonrası güvenli
+      "< 9.0.98"         bu sürümden önceki her şey etkilenir
+      "fixed in 1.38.3"  yamayı içeren sürüm
     """
     found: list[str] = []
     for m in _VERSION_RE.finditer(text):
-        # Aralık eşleşmesi: "7.0.0 through 7.4.2" → "7.0.0 – 7.4.2"
-        if m.group(2) and m.group(3):
-            token = f"{m.group(2)} – {m.group(3)}"
-        # "Before/prior to" eşleşmesi: "before 9.0.98" → "< 9.0.98"
-        elif m.group(4):
-            token = f"< {m.group(4)}"
-        # ">= X" eşleşmesi: yamalı/güvenli sürüm eşiği → ">= 12.1.4-h5"
-        elif m.group(5):
-            token = f">= {m.group(5)}"
-        # Bağımsız versiyon: "PHP 8.3.12" → "8.3.12"
+        (btw_lo, btw_hi, rng_lo, rng_hi, le, ge,
+         fixed, lt, gt, kw, standalone, kb) = m.groups()
+
+        lo, hi = (btw_lo or rng_lo), (btw_hi or rng_hi)
+        if lo and hi:
+            token = f"{lo} – {hi}"
+        elif le:
+            token = f"<= {le}"
+        elif ge:
+            token = f">= {ge}"
+        elif fixed:
+            token = f"fixed in {fixed}"
+        elif lt:
+            token = f"< {lt}"
+        elif gt:
+            token = f">= {gt}"
         else:
-            token = m.group(1) or m.group(6) or ""
+            token = kw or standalone or kb or ""
+
         token = token.strip(" .,;)")
         if not token or len(token) < 3:
             continue
-        # Tarihler/CVE numaraları gibi yanlış pozitifleri at
-        if _FALSE_VERSION_RE.match(token):
+        # Operatör önekini atlayıp asıl sürüm numarasını doğrula
+        bare = token.split()[-1]
+        if _FALSE_VERSION_RE.match(bare) or _FALSE_VERSION_RE.match(token):
             continue
         if token not in found:
             found.append(token)
+        if len(found) >= MAX_VERSIONS:
+            break
     return found
 
 
@@ -511,9 +752,18 @@ def sanitize_gemini_html(raw_html: str) -> str:
 
 
 # HTTP istek başlıkları — User-Agent kimliği ve kabul edilen MIME türleri
+# Makale sayfası indirme başlıkları. UA tarayıcı UA'sı olmalı: "CTI-Automation/1.0
+# (Security Feed Scanner)" gibi bot UA'ları cisa.gov ve vuldb.com tarafından 403
+# ile reddediliyordu. Bu istekler makalenin TAM METNİNİ getiriyor ve versiyon
+# çıkarma tamamen buna dayanıyor — 403 alınan her makale "sürüm bilgisi yok"
+# olarak brifinge giriyordu.
 _REQUEST_HEADERS = {
-    "User-Agent": "CTI-Automation/1.0 (Security Feed Scanner)",
-    "Accept": "text/html,application/xhtml+xml",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 # SSRF koruması: iç ağ adreslerine istek yapılmasını engelle
@@ -575,6 +825,70 @@ def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
 #  toplam süreyi yavaşlatmaz.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# User-Agent stratejisi ÖLÇÜMLE belirlendi, tercih meselesi değil — kaynaklar
+# birbiriyle ÇELİŞEN UA politikaları uyguluyor ve tek bir UA hepsini memnun
+# etmiyor:
+#   cisa.gov          "compatible; Bot/1.0; +RSS" tarzı UA'ları 403 ile reddeder
+#   securelist.com    tarayıcı UA'sına 504 döner, RSS istemcisi UA'sına 200
+#   news.sophos.com   tarayıcı UA'sında read-timeout, RSS istemcisi UA'sında anında yanıt
+# Bu yüzden önce doğal bir RSS istemcisi UA'sı denenir, boş dönerse tarayıcı
+# UA'sıyla bir kez daha denenir.
+_FEED_UA_PRIMARY = feedparser.USER_AGENT
+_FEED_UA_FALLBACK = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+# Accept başlığı: bazı CDN'ler bu olmadan XML yerine HTML sayfası döndürüyor
+_FEED_ACCEPT = (
+    "application/atom+xml,application/rss+xml,application/xml;q=0.9,"
+    "text/xml;q=0.2,*/*;q=0.1"
+)
+# (connect, read) saniye — yavaş kaynak tüm brifingi geciktirmesin.
+# ubuntu.com gibi ara sıra yavaşlayan kaynaklar 20 sn'ye takılıyordu.
+FEED_FETCH_TIMEOUT = (10, 25)
+
+
+def _download_feed(url: str):
+    """Feed'i indir ve ayrıştır; UA politikası yüzünden boş dönerse yeniden dene.
+
+    feedparser.parse(url) ağ isteğini kendi yapar ve TIMEOUT KOYMAZ — yanıt
+    vermeyen tek bir kaynak worker thread'ini süresiz bloke eder ve kaynak
+    sayısı arttıkça tüm brifingi GitHub Actions'ın 20 dk job limitine
+    çarptırabilir. Bu yüzden indirme requests ile (timeout'lu) yapılır.
+    """
+    last_error = None
+    parsed = None
+    for user_agent in (_FEED_UA_PRIMARY, _FEED_UA_FALLBACK):
+        try:
+            resp = requests.get(
+                url,
+                timeout=FEED_FETCH_TIMEOUT,
+                headers={"User-Agent": user_agent, "Accept": _FEED_ACCEPT},
+                allow_redirects=True,
+            )
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.content)
+            if parsed.entries:
+                return parsed
+        except requests.RequestException as exc:
+            last_error = exc
+    if parsed is not None:
+        return parsed          # her iki UA da boş döndü — çağıran 0 entry loglar
+    raise last_error or RuntimeError(f"Feed indirilemedi: {url}")
+
+
+def _entry_datetime(entry) -> datetime | None:
+    """feedparser'ın ayrıştırdığı tarihi timezone-aware datetime'a çevir."""
+    for attr in ("published_parsed", "updated_parsed", "created_parsed"):
+        parsed = getattr(entry, attr, None)
+        if parsed:
+            try:
+                return datetime(*parsed[:6], tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def get_rss_image(entry) -> str:
     """RSS entry'den görsel adayı çıkar."""
     # Check media:thumbnail
@@ -609,7 +923,7 @@ def get_rss_image(entry) -> str:
 def fetch_feed(name: str, url: str) -> list[dict]:
     """Tek bir RSS feed'i çek ve makale listesi olarak döndür."""
     try:
-        feed = feedparser.parse(url)
+        feed = _download_feed(url)
         articles = []
         # Her entry'den standart alanları çıkar (RSS/Atom uyumluluğu için getattr)
         for entry in feed.entries:
@@ -618,6 +932,12 @@ def fetch_feed(name: str, url: str) -> list[dict]:
                 "link": getattr(entry, "link", getattr(entry, "id", "")),
                 "pubDate": getattr(entry, "published", getattr(entry, "updated", "")),
                 "isoDate": getattr(entry, "published", getattr(entry, "updated", "")),
+                # feedparser'ın kendi ayrıştırdığı struct_time — string
+                # ayrıştırmadan ÇOK daha güvenilir; kaynağa özgü tarih
+                # formatları (Debian, cvefeed, JPCERT) burada zaten çözülmüş
+                # oluyor. Bu alan olmadan o makaleler tarih ayrıştırılamadığı
+                # için sessizce 24 saat süzgecine takılıp düşüyordu.
+                "parsed_date": _entry_datetime(entry),
                 "description": getattr(entry, "summary", ""),
                 # content:encoded varsa kullan (Atom'da daha zengin içerik)
                 "content_encoded": (
@@ -697,84 +1017,199 @@ def parse_date(date_str: str) -> datetime | None:
 
 
 def filter_recent(articles: list[dict], hours: int = 24) -> list[dict]:
-    """Sadece son N saatteki makaleleri tut (varsayılan 24 saat)."""
+    """Sadece son N saatteki makaleleri tut (varsayılan 24 saat).
+
+    Tarih iki kanaldan okunur: önce feedparser'ın kendi ayrıştırdığı
+    struct_time (güvenilir), o yoksa string ayrıştırma. Hiçbiri işe
+    yaramazsa makale ATILMAZ — tarihsiz bırakılıp elde tutulur, çünkü
+    "tarihi okunamadı" ile "eski haber" aynı şey değildir ve sessizce
+    atmak advisory kaybına yol açıyordu.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     recent = []
+    undated = 0
     for a in articles:
-        dt = parse_date(a.get("isoDate") or a.get("pubDate", ""))
-        if dt and dt >= cutoff:
+        dt = a.get("parsed_date") or parse_date(a.get("isoDate") or a.get("pubDate", ""))
+        if dt is None:
+            undated += 1
             recent.append(a)
+            continue
+        if dt >= cutoff:
+            recent.append(a)
+    if undated:
+        log.info("  %d makalenin tarihi okunamadı — elde tutuldu", undated)
     return recent
+
+
+_TITLE_TOKEN_RE = re.compile(r"[0-9a-zà-ÿ]+")
+# Başlık benzerliğinde ayırt edici olmayan kelimeler
+_STOPWORDS = frozenset("""
+a an the of in on for to and or with new via as at by is are was were
+yeni ile ve bir bu
+""".split())
+# İki başlığın "aynı haber" sayılması için gereken token örtüşmesi
+_TITLE_SIMILARITY_THRESHOLD = 0.75
+# Bu sayıdan fazla CVE içeren makale bir "toplu derleme"dir (Patch Tuesday
+# gibi); CVE tabanlı dedup'a sokulmaz, yoksa tek tek CVE haberlerini yutar.
+_MAX_CVES_FOR_DEDUP = 3
+
+
+def _title_tokens(norm_title: str) -> frozenset[str]:
+    """Başlığı ayırt edici kelime kümesine indirge (dedup için)."""
+    return frozenset(
+        t for t in _TITLE_TOKEN_RE.findall(norm_title)
+        if t not in _STOPWORDS and len(t) > 2
+    )
+
+
+def _is_near_duplicate(tokens: frozenset[str], seen: list[frozenset[str]]) -> bool:
+    """Başlık daha önce görülen bir başlıkla büyük ölçüde örtüşüyor mu?
+
+    Aynı olay 5 farklı feed'den "Fortinet FortiWeb RCE Exploited in Attacks"
+    ve "Hackers Exploit FortiWeb RCE Vulnerability" gibi farklı başlıklarla
+    geliyordu; birebir başlık karşılaştırması bunları yakalayamıyor ve
+    brifingde aynı haber tekrar tekrar yer alıyordu.
+    """
+    if not tokens:
+        return False
+    for prev in seen:
+        if not prev:
+            continue
+        overlap = len(tokens & prev) / min(len(tokens), len(prev))
+        if overlap >= _TITLE_SIMILARITY_THRESHOLD:
+            return True
+    return False
+
+
+# Bu uzunluğun altındaki TEK KELİMELİK ürün adları jenerik sayılır
+_SPECIFIC_NAME_MIN_LEN = 10
+
+
+def _is_specific_name(name: str) -> bool:
+    """Ürün adı tek başına eşleşmeye yetecek kadar ayırt edici mi?
+
+    Model numarası veya birden fazla kelime içeren bir ürün adı bir makalede
+    geçiyorsa haber gerçekten o ürünle ilgilidir. Ama tek kelimelik, yaygın
+    işletim sistemi / programlama dili adları neredeyse HER güvenlik haberinin
+    gövdesinde bir kez geçer — bambaşka bir platformun malware analizinde bile.
+    Bu tür adların gövdede tek geçişi eşleşme için yeterli sayılmamalı.
+    """
+    return (
+        " " in name or "-" in name
+        or any(ch.isdigit() for ch in name)
+        or len(name) >= _SPECIFIC_NAME_MIN_LEN
+    )
+
+
+def _find_product(text: str, norm_title: str,
+                  patterns: list[tuple[str, re.Pattern]]) -> str | None:
+    """Metinde eşleşen en spesifik ürün adını bul.
+
+    patterns UZUNDAN KISAYA sıralı gelir; ilk eşleşme en spesifik olandır.
+    Jenerik (tek kelimelik, kısa) adlar yalnızca başlıkta geçiyorsa veya
+    metinde somut bir CVE varsa kabul edilir — aksi halde geçici aday
+    olarak tutulur ve daha iyi bir eşleşme çıkmazsa elenir.
+    """
+    weak_candidate = None
+    for name, pattern in patterns:
+        if not pattern.search(text):
+            continue
+        if _is_specific_name(name) or pattern.search(norm_title):
+            return name
+        if weak_candidate is None:
+            weak_candidate = name
+    # Jenerik ad sadece gövdede geçti: somut bir CVE varsa haber yine de
+    # o ürünle ilgili bir advisory olabilir; yoksa yanlış pozitiftir.
+    if weak_candidate and _CVE_RE.search(text):
+        return weak_candidate
+    return None
 
 
 def match_articles(articles: list[dict]) -> list[dict]:
     """Makaleleri envantere göre eşleştir, puanla ve sırala.
 
     Akış:
-      1. Duplicate başlıkları at (aynı haber farklı feed'lerden gelmiş olabilir)
-      2. HIGH_SIGNAL kelime yoksa at (gürültü süzgeci)
-      3. Önce exact product match, sonra alias match dene
-      4. Öncelik puanı hesapla ve buna göre sırala
+      1. Gürültü başlıklarını at (webinar/podcast/pazarlama)
+      2. HIGH_SIGNAL kelime yoksa at (kelime sınırlı — "source" artık RCE değil)
+      3. Ürün eşleştir: en SPESİFİK ad kazanır, tek kelimelik jenerik
+         adlar ek kanıt ister (bkz. _is_specific_name)
+      4. Yinelenenleri ele: başlık benzerliği + CVE örtüşmesi
+      5. Öncelik puanı hesapla ve sırala
     """
-    # Envanteri normalize et (lowercase, kısa olanları at)
-    exact_products = [norm(p) for p in INVENTORY if len(p) >= 3]
+    # Envanteri normalize et; UZUN adlar önce denensin ki en spesifik ürün
+    # kazansın (model numarası içeren tam ad, aynı vendor'un kısa adı yerine).
+    # Eskiden envanterdeki rastgele sıra hangi ürünün eşleşeceğini belirliyordu
+    # ve brifingde haberle ilgisiz, daha genel bir ürün adı görünebiliyordu.
+    exact_products = sorted(
+        {norm(p) for p in INVENTORY if len(norm(p)) >= 3},
+        key=len, reverse=True,
+    )
 
     # Sadece envanterde olan vendor'ların alias'larını aktif et
     active_aliases = []
     for entry in VENDOR_ALIASES:
         if any(entry["vendor_key"] in p for p in exact_products):
             active_aliases.extend(norm(a) for a in entry["aliases"])
+    active_aliases.sort(key=len, reverse=True)
 
-    seen_titles: set[str] = set()  # Duplicate başlık tespiti için
+    # Ürün adı → derlenmiş kelime-sınırlı desen (her makalede yeniden
+    # compile etmek 160 ürün × 500 makale = 80.000 gereksiz compile demekti)
+    def _compile(name: str):
+        return re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])", re.IGNORECASE)
+
+    product_patterns = [(p, _compile(p)) for p in exact_products]
+    alias_patterns = [(a, _compile(a)) for a in active_aliases]
+
+    seen_token_sets: list[frozenset[str]] = []
+    seen_cves: set[str] = set()
     matches = []
 
     for article in articles:
         raw_content = article.get("content_encoded") or article.get("description", "")
         title = article.get("title", "")
         norm_title = norm(title)
+        if not norm_title:
+            continue
 
-        # Aynı başlık daha önce eklendiyse atla (cross-feed dedup)
-        if norm_title in seen_titles:
+        # 1) Pazarlama/etkinlik gürültüsü — sadece başlıkta aranır
+        if _NOISE_TITLE_RE.search(norm_title):
             continue
 
         # İçeriği temizle ve eşleştirme metnini oluştur
         clean_content = norm(strip_html(raw_content))[:3000]
         text = norm_title + " " + clean_content
 
-        # HIGH_SIGNAL kelime yoksa güvenlik haberi değil — atla
-        if not any(kw in text for kw in HIGH_SIGNAL):
+        # 2) HIGH_SIGNAL kelime yoksa güvenlik haberi değil — atla
+        if not has_high_signal(text):
             continue
 
-        # 1) Exact product match: kelime sınırı ile (substring değil)
-        matched_product = None
-        for product in exact_products:
-            if len(product) < 3:
-                continue
-            escaped = re.escape(product)
-            if re.search(rf"(?<![\w-]){escaped}(?![\w-])", text, re.IGNORECASE):
-                matched_product = product
-                break
+        # 3) Yinelenen başlık (birebir veya yakın benzer)
+        tokens = _title_tokens(norm_title)
+        if _is_near_duplicate(tokens, seen_token_sets):
+            continue
 
-        # 2) Alias match: exact bulunamadıysa alternatif adları dene
+        # 4) Ürün eşleştir — önce envanter adları, sonra alias'lar
+        matched_product = _find_product(text, norm_title, product_patterns)
         if not matched_product:
-            for alias in active_aliases:
-                escaped_alias = re.escape(alias)
-                if re.search(rf"(?<![\w-]){escaped_alias}(?![\w-])", text, re.IGNORECASE):
-                    matched_product = alias
-                    break
-
-        # Hiçbir ürünle eşleşmediyse atla
+            matched_product = _find_product(text, norm_title, alias_patterns)
         if not matched_product:
             continue
 
-        seen_titles.add(norm_title)
+        # 5) CVE tabanlı çapraz-feed dedup: aynı CVE'yi işleyen ikinci haber
+        #    aynı brifingde ayrı blok olarak yer kaplamasın.
+        cves = {c.upper() for c in _CVE_RE.findall(text)}
+        if 0 < len(cves) <= _MAX_CVES_FOR_DEDUP and cves & seen_cves:
+            continue
+
+        seen_token_sets.append(tokens)
+        seen_cves |= cves
         matches.append({
             "title": title,
             "link": article.get("link", ""),
             "pubDate": article.get("pubDate", ""),
             "matched_product": matched_product,
             "content": clean_content[:500],  # Gemini prompt'una eklenecek RSS özeti
-            "priority_score": score_article(text),
+            "priority_score": score_article(text, norm_title, matched_product),
             "image_candidate": article.get("image_candidate", ""),
         })
 
@@ -884,11 +1319,28 @@ def _classify_error(exc: Exception) -> str:
 # Model zinciri: birincil (en kaliteli) + yedekler. Birincil model erişilemez veya
 # kotası dolu olursa sıradaki denenir. Her modelin AYRI günlük kotası ve AYRI
 # kapasitesi var → 3.5-flash 20 RPD'yi doldursa ya da 503 verse bile brifing kurtulur.
-_MODEL_CHAIN = ("gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash")
+#
+# 2026-08-27: gemini-2.0-flash EMEKLİYE AYRILDI ve zincirin son halkası olduğu
+# için sessiz bir tek-nokta-arıza haline gelmişti — 3.5 ve 2.5 aynı anda 504
+# verdiğinde son yedek de 404 döndü ve brifing tamamen düştü. Zincir mevcut
+# modellerle yenilendi (API'den canlı olarak doğrulandı). Modeller Google
+# tarafından emekliye ayrıldığı için bu liste yılda birkaç kez kontrol edilmeli:
+#   client.models.list() → generateContent destekleyenleri listeler.
+_MODEL_CHAIN = (
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",  # Google'ın güncel flash takma adı — son çare
+)
 
 # Geçici hatada model-içi bekleme programı (saniye). Kısa tutulur: yoğunluk geçmezse
 # zaten yedek modele düşülür (toplam süre TimeoutStartSec=600 altında kalsın).
 _TRANSIENT_BACKOFF = (10, 30)
+
+# Bir denemeyi başlatmak için gereken asgari kalan süre (saniye). Ölçülen en
+# yavaş başarılı yanıt ~281 sn olduğundan, bundan azı kalmışsa yeni istek
+# atmak yalnızca bütçeyi tüketir.
+_MIN_ATTEMPT_SECONDS = 300
 
 
 def analyze_with_gemini(prompt: str) -> str:
@@ -913,11 +1365,24 @@ def analyze_with_gemini(prompt: str) -> str:
     )
     last_error = None
     max_attempts = len(_TRANSIENT_BACKOFF) + 1  # model başına: 1 ilk + retry sayısı
+    # Toplam bütçe: zincir ne kadar uzarsa uzasın job timeout'unu aşmasın
+    deadline = time.monotonic() + GEMINI_TOTAL_BUDGET_SEC
 
     # Dış döngü: modeller (birincil → yedekler)
     for model in _MODEL_CHAIN:
         # İç döngü: aynı model için geçici hata retry'ları
         for attempt in range(1, max_attempts + 1):
+            remaining = deadline - time.monotonic()
+            # Bitmesine imkân olmayan bir isteği başlatma — bütçeyi
+            # tüketip job'ı timeout'a sürüklemekten başka işe yaramaz.
+            if remaining < _MIN_ATTEMPT_SECONDS:
+                log.error(
+                    "Gemini toplam süre bütçesi (%d sn) doldu — kalan modeller "
+                    "denenmeyecek", GEMINI_TOTAL_BUDGET_SEC,
+                )
+                raise RuntimeError(
+                    "Gemini API: toplam süre bütçesi doldu"
+                ) from last_error
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -1242,7 +1707,7 @@ def main() -> None:
     log.info("CTI News Feed Automation — started")
     today = turkish_date()  # "17 Mayıs 2026, Cumartesi"
 
-    # 1. Tüm RSS feed'lerini paralel çek (66 kaynak, 10 worker)
+    # 1. Tüm RSS feed'lerini paralel çek (10 worker)
     log.info("Fetching %d RSS feeds...", len(FEEDS))
     all_articles = fetch_all_feeds()
     log.info("Total articles fetched: %d", len(all_articles))
