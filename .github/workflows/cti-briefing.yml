@@ -3,9 +3,12 @@
 #  Ubuntu sunucudaki systemd timer'in yerini alir.
 #  Public repo oldugu icin Actions dakikalari UCRETSIZ ve sinirsizdir.
 #
-#  KURULUM: Settings > Secrets and variables > Actions altina 5 secret ekle:
-#    GEMINI_API_KEY, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO
+#  KURULUM: Settings > Secrets and variables > Actions altina 7 secret ekle:
+#    GEMINI_API_KEY, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM, EMAIL_TO,
+#    INVENTORY_JSON, VENDOR_ALIASES_JSON
 #  (SMTP_SERVER/SMTP_PORT gizli bilgi degil, asagida sabit yazili.)
+#  INVENTORY_JSON/VENDOR_ALIASES_JSON: organizasyonun urun envanterini
+#  ifsa ettigi icin kaynak kodunda degil, secret olarak tutulur.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 name: CTI Tehdit Brifingi
@@ -53,14 +56,16 @@ jobs:
       # Secret eksikse anlasilir hata ver (yoksa kod tuhaf sekilde patlar)
       - name: Secret kontrolu
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          SMTP_USERNAME:  ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          SMTP_USERNAME:       ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD:       ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:          ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:            ${{ secrets.EMAIL_TO }}
+          INVENTORY_JSON:      ${{ secrets.INVENTORY_JSON }}
+          VENDOR_ALIASES_JSON: ${{ secrets.VENDOR_ALIASES_JSON }}
         run: |
           eksik=""
-          for s in GEMINI_API_KEY SMTP_USERNAME SMTP_PASSWORD EMAIL_FROM EMAIL_TO; do
+          for s in GEMINI_API_KEY SMTP_USERNAME SMTP_PASSWORD EMAIL_FROM EMAIL_TO INVENTORY_JSON VENDOR_ALIASES_JSON; do
             [ -z "${!s}" ] && eksik="$eksik $s"
           done
           if [ -n "$eksik" ]; then
@@ -73,11 +78,13 @@ jobs:
       - name: Brifingi calistir
         env:
           # Gizli degerler — GitHub Secrets'tan gelir, loglarda otomatik maskelenir
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          SMTP_USERNAME:  ${{ secrets.SMTP_USERNAME }}
-          SMTP_PASSWORD:  ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
+          SMTP_USERNAME:       ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD:       ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM:          ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:            ${{ secrets.EMAIL_TO }}
+          INVENTORY_JSON:      ${{ secrets.INVENTORY_JSON }}
+          VENDOR_ALIASES_JSON: ${{ secrets.VENDOR_ALIASES_JSON }}
           # Gizli olmayan ayarlar (bos string gecmemek icin sabit yazildi)
           SMTP_SERVER: smtp.gmail.com
           SMTP_PORT: "587"

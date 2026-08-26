@@ -16,6 +16,7 @@ analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
 import locale
 import os
 import re
+import json                          # Envanter/alias listelerini env'den yükleme
 import html                          # HTML escape (XSS koruması için)
 import logging
 import logging.handlers              # RotatingFileHandler (log boyut sınırı)
@@ -108,112 +109,39 @@ GEMINI_REQUEST_TIMEOUT_MS = 90_000
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  INVENTORY
-#  Ortamda kullanılan ürünlerin listesi (~190 ürün).
+#  Ortamda kullanılan ürünlerin listesi. Bu liste organizasyonun gerçek
+#  saldırı yüzeyini (hangi ürünleri kullandığını) ifşa ettiği için KAYNAK
+#  KODUNDA TUTULMAZ — public repo'da görünmemesi gerekir. Bunun yerine
+#  INVENTORY_JSON ortam değişkeninden (yerelde .env, GitHub Actions'ta
+#  repository secret) JSON dizisi olarak okunur.
 #  match_articles() bu listede bulunan ürün adlarını makale içinde arar.
-#  Yeni ürün eklemek için aşağıya yazman yeterli.
+#  Yeni ürün eklemek için secret/​.env içindeki JSON'u güncellemen yeterli.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-INVENTORY = [
-    "Yoast Wordpress Seo", "Wp Fastest Cache", "Wordpress",
-    "Jasperreports Server", "Telerik Ui For Asp.Net Ajax",
-    "Sun Java System Web Server", "Sophos Sfos", "Sonicwall Sonicos",
-    "Sip Protocol", "Contact Form 7", "Python", "Pureftpd", "Proftpd",
-    "Powerdns Authoritative Server", "Postfix", "Spring Boot",
-    "Spring Framework", "Php", "Plesk", "Parallels Plesk Panel",
-    "Javafx", "Iplanet Web Server", "Openssh", "Openresty", "Nginx",
-    "Netsweeper", "Microsoft Iis", "Office 365", ".Net",
-    "Microsoft Exchange", "Sharepoint", "Outlook Web Access",
-    "Windows Server 2008", "Windows Server 2012",
-    "Internet Information Services", "Lotus Domino",
-    "Litespeed Web Server", "Lighttpd", "Kerio Connect",
-    "Redirection Plugin", "Isc Bind", "Hp Jetdirect",
-    "Bootstrap Framework", "Fortios", "Fortigate", "Big-Ip Ltm",
-    "Big-Ip Local Traffic Manager",
-    "Big-Ip Application Security Manager", "Expressjs", "Exim",
-    "Sonicwall Network Security Appliance 2400", "Cpanel",
-    "Netscaler Gateway Firmware", "Gaia Os", "Vpn-1 Firewall-1 Vsx",
-    "Tinyproxy", "Wp Super Cache", "Apache Tomcat",
-    "Apache Http Server", "Coyote Http Connector", "Coldfusion Builder",
-    "Mini-Httpd", "Zoom", "Esxi", "Vmware Tools", "Vsphere", "Vcenter",
-    "Vsphere Esxi", "Vsphere Client",
-    "Vrealize Suite Lifecycle Manager", "Netbackup Appliance",
-    "Enterprise Vault", "Veeam Backup And Replication", "Teamviewer",
-    "Teamviewer Remote", "Solarwinds Platform",
-    "Solarwinds Virtualization Manager", "Solarwinds Netflow Realtime",
-    "Solarwinds Network Performance Monitor",
-    "Orion Ip Address Manager", "Network Configuration Manager",
-    "Orion User Device Tracker", "Orion Web Performance Monitor",
-    "Server And Application Monitor",
-    "Ip Address Manager Web Interface",
-    "Orion Netflow Traffic Analyzer", "Sap Router", "Sap Netweaver",
-    "Sap Netweaver Abap", "Sap Solution Manager", "Sap Data Services",
-    "Sap Web Dispatcher", "Sap Cloud Connector", "Sap Netweaver Java",
-    "Sap Enterprise Resource Planning",
-    "Sap Netweaver Application Server",
-    "Sap Supplier Relationship Management",
-    "Sap Business Objects Business Intelligence Platform",
-    "Red Hat Enterprise Linux", "Linux Kernel",
-    "Red Hat Network Satellite", "Putty", "Pan-Os",
-    "Palo Alto Networks", "Oracle Database",
-    "Primavera P6 Professional Project Management",
-    "Primavera P6 Enterprise Project Portfolio Management", "Chatgpt",
-    "Nessus", "Microsoft Teams", "365 Copilot",
-    "System Center Configuration Manager", "Keepass",
-    "Ibm Security Guardium", "Tivoli Identity Manager",
-    "Security Identity Manager", "Qradar SIEM",
-    "Hikcentral Professional", "Google Chrome", "Vertex Gemini Api",
-    "Fortimanager", "Fortigate 60E", "Fortigate 60F", "Fortigate 80F",
-    "Fortigate 100D", "Fortigate 400E", "Fortigate 100F",
-    "Fortigate 200E", "Fortigate 1200D", "Fortigate 2600F",
-    "Fortiauthenticator", "Forticlient Ems",
-    "Forticlient Sslvpn Client", "Forticlient", "Big-Ip I2800",
-    "Big-Ip 4000", "Big-Ip Advanced Web Application Firewall",
-    "Cyberark Identity", "Cyberark Viewfinity",
-    "Endpoint Privilege Manager", "Enterprise Password Vault",
-    "Privileged Session Manager", "Citrix Workspace", "Cisco 1921",
-    "Cisco 1941", "Cisco 2921", "Cisco 3945", "Cisco Isr 4451-X",
-    "Cisco Nexus 9000", "Cisco N9K-C9332Pq", "Cisco Ws-C3850-48T",
-    "Cisco Catalyst 2950", "Cisco Catalyst 4500",
-    "Cisco Ws-C3850-24Xs", "Cisco N9K-C93108Tc-Ex",
-    "Cisco N9K-C93180Yc-Ex", "Cisco N9K-C93240Yc-Fx2",
-    "Cisco Catalyst 2960-24Tc-L", "Cisco Catalyst 2960-48Tc-L",
-    "Cisco Catalyst 3560X-48P-S", "Cisco Catalyst 2960-48Pst-L",
-    "Cisco Catalyst 2960S-24Ts-L", "Cisco Catalyst 2960S-24Ts-S",
-    "Cisco Catalyst 2960X-24Ps-L", "Cisco Catalyst 2960X-48Ts-L",
-    "Cisco Catalyst 2960S-48Lps-L", "Cisco Catalyst 2960X-48Fps-L",
-    "Cisco Catalyst 2960X-48Lpd-L", "Cisco Catalyst 2960X-48Lps-L",
-    "Cisco Catalyst 2960Xr-24Ps-L",
-    "Cisco Catalyst 2960-Plus 24Tc-L",
-    "Cisco Catalyst 2960-Plus 48Tc-L",
-    "Cisco Catalyst 2960-Plus 48Pst-L",
-    "Cisco Catalyst 2960-Plus 48Pst-S",
-    "Cisco 2921 Integrated Services Router", "Autocad", "Autocad Lt",
-    "Autocad Plant 3D", "Arubanetworks Clearpass", "Claude Code",
-    "7-Zip",
-    # ── Microsoft Defender ailesi ────────────────────────
-    "Windows Defender", "365 Defender Portal",
-    "Defender For Endpoint", "Defender For Identity",
-    "Windows Defender For Endpoint",
-    "Defender For Endpoint EDR Sensor",
-    "Defender Security Intelligence Updates",
-    # ── Microsoft diğer ─────────────────────────────────
-    "Windows",
-    # ── VMware ──────────────────────────────────────────
-    "Vmware Workstation",
-    # ── SolarWinds (Orion uzun formları) ────────────────
-    "Orion Network Performance Monitor",
-    "Orion Server And Application Manager",
-    "Orion Network Configuration Manager",
-    # ── IBM (uzun form varyantları) ─────────────────────
-    "QRadar Security Information And Event Manager",
-    "Security Guardium Database Activity Monitor",
-    # ── F5 ──────────────────────────────────────────────
-    "Big-Ip",
-    # ── Red Hat ─────────────────────────────────────────
-    "Enterprise Linux Kernel",
-    # ── Fortinet (uzun form varyantı) ───────────────────
-    "Forticlient Endpoint Management Server",
-]
+def _load_json_env(var_name: str, description: str) -> list:
+    """Hassas listeleri (envanter, vendor alias) ortam değişkeninden JSON olarak yükle.
+
+    Sessizce boş listeyle devam ETMEZ — eksik/bozuk secret durumunda hemen
+    RuntimeError fırlatır. Aksi halde envanter boş kalır, match_articles()
+    hiçbir şey eşleştirmez ve otomasyon sessizce "tehdit yok" maili atarak
+    hiçbir şeyin kaçmadığı yanılsaması yaratır (bu, sessiz veri kaybından
+    çok daha tehlikelidir — bkz. GEMINI_API_KEY için aynı fail-loud deseni).
+    """
+    raw = os.environ.get(var_name, "")
+    if not raw:
+        raise RuntimeError(
+            f"{var_name} ortam değişkeni tanımlı değil ({description}). "
+            f"Yerelde .env dosyasına, GitHub Actions'ta repository secret "
+            f"olarak eklenmeli — aksi halde envanter boş kalır ve hiçbir "
+            f"makale eşleşmez."
+        )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{var_name} geçerli bir JSON dizisi değil: {exc}") from exc
+
+
+INVENTORY = _load_json_env("INVENTORY_JSON", "ürün envanteri")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  RSS FEEDS
@@ -353,100 +281,7 @@ def score_article(text: str) -> int:
 # 1) vendor_key envanter ürün adında geçiyor mu? (örn. "cisco" → "cisco 1921")
 # 2) Geçiyorsa o vendor'un alias'ları aktif olur
 # Böylece kullanmadığın vendor'un alias'ları false positive üretmez.
-VENDOR_ALIASES = [
-    {
-        # Cisco router/switch modelleri envanterde — OS ve platform alias'ları
-        "vendor_key": "cisco",
-        "aliases": [
-            "cisco ios", "cisco nx-os", "cisco asa", "cisco ftd",
-            "cisco catalyst", "cisco nexus", "cisco isr",
-        ],
-    },
-    {
-        # FortiOS/FortiGate envanterde — "forti" prefix ile eşleşme
-        "vendor_key": "forti",
-        "aliases": [
-            "fortinet", "fortios", "fortigate", "fortimanager",
-            "forticlient", "fortiauthenticator", "fortianalyzer",
-        ],
-    },
-    {
-        # ESXi/vSphere/vCenter envanterde — VMware platform alias'ları
-        "vendor_key": "vmware",
-        "aliases": [
-            "vmware", "esxi", "vsphere", "vcenter", "vrealize",
-        ],
-    },
-    {
-        # Big-IP LTM/ASM/AWAF envanterde — F5 alternatif adları
-        "vendor_key": "big-ip",
-        "aliases": [
-            "big-ip", "f5 big-ip", "f5 ltm", "f5 asm", "f5 waf",
-        ],
-    },
-    {
-        # SAP Netweaver/Web Dispatcher envanterde — SAP platform alias'ları
-        "vendor_key": "sap",
-        "aliases": [
-            "sap netweaver", "sap abap", "sap solution manager",
-            "sap web dispatcher",
-        ],
-    },
-    {
-        # Exchange/IIS/Teams/SharePoint envanterde — Microsoft alias'ları
-        "vendor_key": "microsoft",
-        "aliases": [
-            "windows server", "microsoft exchange", "sharepoint",
-            "office 365", "microsoft 365", "microsoft iis",
-            "active directory", "microsoft teams", "ms exchange",
-        ],
-    },
-    {
-        # PAN-OS envanterde — Palo Alto alias'ları
-        "vendor_key": "palo alto",
-        "aliases": [
-            "pan-os", "palo alto networks",
-        ],
-    },
-    {
-        # SolarWinds Platform envanterde — Orion alias'ları
-        "vendor_key": "solarwinds",
-        "aliases": ["solarwinds", "orion platform", "solarwinds orion"],
-    },
-    {
-        # Veeam Backup And Replication envanterde
-        "vendor_key": "veeam",
-        "aliases": ["veeam backup", "veeam replication"],
-    },
-    {
-        # WordPress/Yoast/WP Cache envanterde — sadece core alias'lar
-        "vendor_key": "wordpress",
-        "aliases": [
-            "wordpress",
-        ],
-    },
-    {
-        # Apache Tomcat / HTTP Server envanterde
-        "vendor_key": "apache",
-        "aliases": [
-            "apache tomcat", "apache httpd", "apache http server",
-        ],
-    },
-    {
-        # Citrix Workspace / Netscaler envanterde
-        "vendor_key": "citrix",
-        "aliases": [
-            "citrix", "netscaler", "citrix adc", "citrix workspace",
-        ],
-    },
-    {
-        # CyberArk Identity/Viewfinity/EPM envanterde
-        "vendor_key": "cyberark",
-        "aliases": [
-            "cyberark", "privileged access manager",
-        ],
-    },
-]
+VENDOR_ALIASES = _load_json_env("VENDOR_ALIASES_JSON", "vendor alias eşleştirme tablosu")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  GEMINI SYSTEM PROMPT
@@ -464,7 +299,7 @@ HER HABER İÇİN aşağıdaki HTML formatında bir brifing bloğu yaz:
 <div style="margin-bottom:24px;padding:16px;border-left:4px solid [SEVERİTE_RENK];background:#f9f9f9;font-family:Arial,sans-serif;">
   <h3 style="margin:0 0 8px 0;color:[SEVERİTE_RENK];">[SEVERİTE: YÜKSEK/ORTA/DÜŞÜK] Haber Başlığı</h3>
   [[IMG:n]]
-  <p><strong>📅 Tarih:</strong> Yayın tarihi</p>
+  <p><strong>📅 Haber Tarihi:</strong> Yayın tarihi</p>
   <p><strong>💾 Eşleşen Ürün:</strong> matched_product değeri</p>
   <p><strong>🔴 Etkilenen Sürümler:</strong> Zafiyetten etkilenen (savunmasız) versiyon numaraları/aralıkları</p>
   <p><strong>🟢 Yamalı Sürümler:</strong> Yamayı içeren güvenli versiyon numaraları (yükseltme hedefi)</p>
@@ -483,6 +318,7 @@ KURALLAR:
 - Yanıtın tamamı TÜRKÇE olmalı. Teknik terimler, CVE numaraları, ürün isimleri ve komutlar İNGİLİZCE kalmalı.
 - Giriş veya sonuç cümlesi YAZMA. Doğrudan ilk brifing bloğuyla başla.
 - "Özet" 25 kelimeyi geçmemeli.
+- "Özet" içinde zafiyetin istismar edildiği, keşfedildiği veya olayın gerçekleştiği SPESİFİK bir tarih geçiyorsa (bu, haberin yayın tarihi DEĞİL — o "Haber Tarihi" alanında zaten var; burası olayın/istismarın kendi tarihi), bu tarihi <strong style="color:#0d6efd;">...</strong> ile vurgula. Örnek: "Zafiyet <strong style=\"color:#0d6efd;\">15 Ağustos 2026</strong>'dan beri aktif istismar ediliyor." Böyle bir tarih geçmiyorsa bu kuralı uygulama, tarih uydurma.
 - "Aksiyon" imperatif ve doğrudan olmalı. Spesifik bir aksiyon yoksa: "Güncellemeleri takip et."
 - Her brifing bloğunda <h3> başlığının hemen altına tam olarak [[IMG:n]] yaz (n, o makalenin sana verilen numarasıdır, örneğin [[IMG:1]]). Görseli olsa da olmasa da bu token'ı mutlaka ekle.
 - Eğer iki haber aynı CVE veya olayı işliyorsa, ikincisi için yalnızca şunu yaz:
@@ -522,19 +358,28 @@ def norm(s: str) -> str:
 
 
 # Versiyon numaralarını yakalayan regex desenleri
+# Build/patch soneki: "-h5", "-h16-rc1" gibi. Tire sonrası HARF şartı var, bu yüzden
+# "7.0-7.6" gibi aralık ayırıcısı tire ile KARIŞMAZ (7 bir harf değil, sayı).
+_BUILD_SUFFIX = r"(?:-[a-zA-Z]+\d*)*"
+
 _VERSION_RE = re.compile(
-    r"""
+    rf"""
     # "version 7.4.2", "ver 3.1.0", "v2.0.1"
     (?:versions?\s*:?\s*|ver\.?\s*|[Vv])(\d+\.\d+(?:\.\d+)+(?:[a-z0-9._-]*)?)
     |
-    # "FortiOS 7.0.0 through 7.4.2", "7.0 – 7.6", "< 9.0.98"
-    (\d+\.\d+(?:\.\d+)*)\s*(?:through|thru|to|–|—|-)\s*(\d+\.\d+(?:\.\d+)*)
+    # "FortiOS 7.0.0 through 7.4.2", "7.0 – 7.6" — her iki uç da build soneki alabilir
+    # (örn. "12.1.2 through 12.1.4-h*" gibi Palo Alto tablo formatı)
+    (\d+\.\d+(?:\.\d+)*{_BUILD_SUFFIX})\s*(?:through|thru|to|–|—|-)\s*(\d+\.\d+(?:\.\d+)*{_BUILD_SUFFIX})
     |
-    # "before 9.0.98", "prior to 10.2.1", "earlier than 7.6.3", "< 3.1.0"
-    (?:before|prior\s+to|earlier\s+than|<)\s*(\d+\.\d+(?:\.\d+)+)
+    # "before 9.0.98", "prior to version 10.2.1", "earlier than 7.6.3", "< 3.1.0", "<= 12.1.4-h5"
+    (?:before|prior\s+to|earlier\s+than|<=?)\s*(?:version\s+)?(\d+\.\d+(?:\.\d+)+{_BUILD_SUFFIX})
     |
-    # Ürün adından sonra gelen bağımsız versiyon: "FortiOS 7.4.2", "PHP 8.3.12"
-    (?<=[A-Za-z]\s)(\d+\.\d+\.\d+(?:\.\d+)*(?:[a-z0-9._-]*)?)
+    # ">= 12.1.4-h5", "> 7.4.6" — yamalı/güvenli sürüm eşiği (PSIRT tablolarında sık görülür)
+    >=?\s*(?:version\s+)?(\d+\.\d+(?:\.\d+)+{_BUILD_SUFFIX})
+    |
+    # Ürün adından/etiketten sonra gelen bağımsız versiyon: "FortiOS 7.4.2",
+    # "fixed in 7.4.7", "Affected: 11.1.4-h33" (iki nokta üst üste de tetikler)
+    (?<=[A-Za-z:]\s)(\d+\.\d+\.\d+(?:\.\d+)*(?:[a-z0-9._-]*)?)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -561,9 +406,12 @@ def extract_versions(text: str) -> list[str]:
         # "Before/prior to" eşleşmesi: "before 9.0.98" → "< 9.0.98"
         elif m.group(4):
             token = f"< {m.group(4)}"
+        # ">= X" eşleşmesi: yamalı/güvenli sürüm eşiği → ">= 12.1.4-h5"
+        elif m.group(5):
+            token = f">= {m.group(5)}"
         # Bağımsız versiyon: "PHP 8.3.12" → "8.3.12"
         else:
-            token = m.group(1) or m.group(5) or ""
+            token = m.group(1) or m.group(6) or ""
         token = token.strip(" .,;)")
         if not token or len(token) < 3:
             continue
