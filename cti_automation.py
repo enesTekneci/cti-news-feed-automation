@@ -1161,6 +1161,21 @@ def inject_images(html_str: str, cid_map: dict[int, str], titles_map: dict[int, 
     return re.sub(r'\[\[IMG:(\d+)\]\]', repl, html_str)
 
 
+# DRY_RUN=true: RSS/eşleştirme/Gemini/versiyon çıkarma tam olarak çalışır
+# (secret'lar ve pipeline gerçekten test edilir), ama son adımda SMTP hiç
+# çağrılmaz — mail atılmaz. Önizleme yerine logs/dry_run_preview.html'e
+# yazılır (görsel <img cid:...> referansları düz HTML'de kırık görünür,
+# bu bilinen ve kabul edilen bir sınırlama — asıl amaç metin/versiyon/
+# tarih alanlarını mail göndermeden doğrulamak).
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() == "true"
+
+
+def _write_dry_run_preview(email_body: str) -> None:
+    """DRY_RUN modunda e-posta gövdesini dosyaya yaz, SMTP'ye hiç dokunma."""
+    preview_path = LOG_DIR / "dry_run_preview.html"
+    preview_path.write_text(email_body, encoding="utf-8")
+    log.info("DRY_RUN aktif — mail GÖNDERİLMEDİ. Önizleme: %s", preview_path)
+
 
 def send_email(subject: str, html_body: str,
                images: list[tuple[str, bytes]] | None = None) -> None:
@@ -1335,20 +1350,26 @@ def main() -> None:
 
         # E-posta gövdesini oluştur ve gönder
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", full_content)
-        send_email(
-            subject=f"🛡️ CTI Tehdit Brifing — {today}",
-            html_body=email_body,
-            images=final_images
-        )
-        log.info("Threat briefing sent successfully.")
+        if DRY_RUN:
+            _write_dry_run_preview(email_body)
+        else:
+            send_email(
+                subject=f"🛡️ CTI Tehdit Brifing — {today}",
+                html_body=email_body,
+                images=final_images
+            )
+            log.info("Threat briefing sent successfully.")
     else:
         # Eşleşme yoksa "tehdit yok" bildirimi gönder
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", NO_THREATS_CONTENT)
-        send_email(
-            subject=f"✅ CTI Tarama — Tehdit Yok — {today}",
-            html_body=email_body,
-        )
-        log.info("No threats — notification sent.")
+        if DRY_RUN:
+            _write_dry_run_preview(email_body)
+        else:
+            send_email(
+                subject=f"✅ CTI Tarama — Tehdit Yok — {today}",
+                html_body=email_body,
+            )
+            log.info("No threats — notification sent.")
 
     log.info("CTI News Feed Automation — finished")
 

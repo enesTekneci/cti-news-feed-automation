@@ -23,6 +23,11 @@ on:
       timezone: "Europe/Istanbul"
   # Actions sekmesinden "Run workflow" butonu ile elle de calistirilabilir
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: mail GONDERME, sadece onizlemeyi artifact olarak uret"
+        type: boolean
+        default: false
 
 # Ayni anda birden fazla calistirma olmasin (elle tetikleme + zamanlanmis cakisirsa)
 concurrency:
@@ -88,7 +93,19 @@ jobs:
           # Gizli olmayan ayarlar (bos string gecmemek icin sabit yazildi)
           SMTP_SERVER: smtp.gmail.com
           SMTP_PORT: "587"
+          # workflow_dispatch'ten gelen dry_run girdisi (schedule'da hep "false")
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: python cti_automation.py
+
+      # Dry run onizlemesini indirilebilir yap (mail atilmadi, HTML burada)
+      - name: Dry run onizlemesini yukle
+        if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-preview-${{ github.run_id }}
+          path: logs/dry_run_preview.html
+          retention-days: 7
+          if-no-files-found: warn
 
       # Hata olursa uygulama logunu indirilebilir yap (teshis icin)
       - name: Hata durumunda logu yukle
