@@ -1118,14 +1118,29 @@ def _is_specific_name(name: str) -> bool:
 _NEARBY_VERSION_RE = re.compile(rf"\s{{0,20}}{_VER_LOOSE}")
 
 
-def _has_nearby_version(text: str, pattern: re.Pattern) -> bool:
-    """`pattern`'ın metindeki herhangi bir geçişinin hemen ardından bir
-    sürüm numarası var mı? (bkz. _NEARBY_VERSION_RE yorumu)
+def _is_filename_extension_usage(s: str, match_start: int) -> bool:
+    """Eşleşme hemen bir '.' işaretinden sonra mı geliyor?
+
+    "index.php", "usr-check.php", "save-cvs.php" gibi dosya adı/uzantısı
+    kullanımları — normal kelime-sınırı regex'i (`(?<![\\w-])`) bunları
+    ELEMEZ çünkü nokta bir kelime karakteri değildir. Bu, üçüncü parti bir
+    ürünün (örn. bir dosya yöneticisi eklentisi) İÇ dosya yapısıdır, bizim
+    envanterimizdeki dilin/platformun kendisiyle ilgisi yoktur.
     """
-    return any(
-        _NEARBY_VERSION_RE.match(text, m.end())
-        for m in pattern.finditer(text)
-    )
+    return match_start > 0 and s[match_start - 1] == "."
+
+
+def _has_nearby_version(text: str, pattern: re.Pattern) -> bool:
+    """`pattern`'ın metindeki herhangi bir geçişinin (dosya uzantısı
+    kullanımları hariç) hemen ardından bir sürüm numarası var mı?
+    (bkz. _NEARBY_VERSION_RE yorumu)
+    """
+    for m in pattern.finditer(text):
+        if _is_filename_extension_usage(text, m.start()):
+            continue
+        if _NEARBY_VERSION_RE.match(text, m.end()):
+            return True
+    return False
 
 
 # Zafiyet SINIFI adları: jenerik bir ürün adının hemen ardından bunlardan
@@ -1156,9 +1171,12 @@ def _title_match_is_genuine(norm_title: str, pattern: re.Pattern) -> bool:
 
     Aynı başlıkta hem "gerçek" hem "sınıf-adı" kullanımı bir arada olabilir
     (nadir) — o yüzden İLK eşleşmede değil, HERHANGİ bir eşleşmede genuine
-    olan varsa kabul edilir.
+    olan varsa kabul edilir. Dosya uzantısı kullanımları (bkz.
+    _is_filename_extension_usage) hiç sayılmaz.
     """
     for m in pattern.finditer(norm_title):
+        if _is_filename_extension_usage(norm_title, m.start()):
+            continue
         if _VULN_CLASS_RE.match(norm_title, m.end()) is None:
             return True
     return False
@@ -1179,7 +1197,10 @@ def _find_product(text: str, norm_title: str,
     2026-08-27: Eskiden "metinde HERHANGİ bir CVE varsa kabul et" ve "başlıkta
     HERHANGİ bir geçiş yeterli" gibi gevşek kurallar vardı; VulDB/cvefeed gibi
     kaynaklar HER başlığa hem CVE numarası hem zafiyet sınıfı adını koyduğu
-    için bu kurallar pratikte hiçbir şeyi elemiyordu.
+    için bu kurallar pratikte hiçbir şeyi elemiyordu. Aynı gün ikinci bir
+    yanlış pozitif deseni daha bulundu: "index.php", "usr-check.php" gibi
+    dosya adı/uzantısı kullanımları (bkz. _is_filename_extension_usage) —
+    bunlar da hiçbir koşulda geçerli kanıt sayılmaz.
     """
     for name, pattern in patterns:
         if not pattern.search(text):
