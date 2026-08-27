@@ -114,7 +114,19 @@ GEMINI_REQUEST_TIMEOUT_MS = 360_000
 # Tek istek sınırını yükseltmek tek başına yetmez: 4 model × 3 deneme ×
 # 360 sn = 72 dakika eder ve job timeout'unu yine patlatır. Bu bütçe,
 # zincirin ne kadar uzarsa uzasın toplamda sınırlı kalmasını garanti eder.
-GEMINI_TOTAL_BUDGET_SEC = 900
+#
+# 2026-08-27: 900 sn (15 dk) yetersiz çıktı — analyze_with_gemini()'deki
+# _HANG_THRESHOLD_SECONDS yorumuna bak: bir model art arda 2 kez ~300 sn
+# asılı kalıp koptu, bütçenin çoğu (2×300 sn + backoff) TEK modelde tükendi
+# ve zincir sağlıklı olan yedek modele hiç ulaşamadı (workflow run
+# 33064763459, mail gitmedi). O sorun asıl olarak retry mantığındaki
+# tasarım hatasıydı (aynı asılı modeli tekrar tekrar denemek) ve ayrıca
+# düzeltildi. Bütçe yine de 1200 sn'ye (20 dk) çıkarıldı: 30 dk'lık job
+# timeout'u içinde rahatça sığıyor (feed çekme + görsel işleme ~2-3 dk,
+# mail gönderme saniyeler sürüyor) ve artık israf edilmeyen bu süre,
+# gerçekten birden fazla modelin aynı anda dalgalandığı nadir durumlarda
+# zincirin daha derinlerine inebilmeyi sağlıyor.
+GEMINI_TOTAL_BUDGET_SEC = 1200
 # Token matematiği (50 makale × ~900 token/makale ≈ 45K token):
 #   Günlük bütçe: 250K → %18 kullanım. TPM: tek istek/gün, aşım riski yok.
 #   Makale sayısı artarsa body_chars dinamik olarak kısılır (build_prompt içinde).
@@ -1352,14 +1364,35 @@ _TRANSIENT_BACKOFF = (10, 30)
 # atmak yalnızca bütçeyi tüketir.
 _MIN_ATTEMPT_SECONDS = 300
 
+# 2026-08-27: Gerçek üretimde gözlemlenen üçüncü bir hata modu — modelin
+# HIZLI 503 vermesi değil, isteği ~5 dakika boyunca yanıtsız ASILI TUTUP
+# sonra bağlantıyı koparması ("Server disconnected without sending a
+# response"). Bu, sabit sayıda deneme yapan eski mantıkla BİRLEŞTİĞİNDE
+# felakete yol açtı: tek bir modelde art arda 2 asılı deneme (~2×300 sn)
+# toplam bütçenin (900 sn) çoğunu tüketti ve zincir HİÇ sağlıklı olan
+# gemini-3.6-flash'a ulaşamadan "bütçe doldu" hatasıyla durdu — o gün
+# hiç mail gitmedi (2026-08-27, workflow run 33064763459).
+#
+# Çözüm: bir deneme bu eşikten UZUN sürüp başarısız olduysa (yani gerçek
+# bir asılı-kalma yaşandıysa), aynı modeli TEKRAR DENEMEDEN doğrudan bir
+# sonraki modele geç. Aynı modeli tekrar denemek, o model zaten dakikalarca
+# yanıt veremiyorsa yardımcı olmaz — sadece paylaşılan toplam bütçeyi,
+# asıl işe yarayacak olan FARKLI bir modelin payından çalar. Kısa/anlık
+# hatalar (örn. birkaç saniyede dönen 503) bu eşiğin çok altında kalır ve
+# hâlâ normal kısa-bekle-tekrar-dene mantığından geçer.
+_HANG_THRESHOLD_SECONDS = 60
+
 
 def analyze_with_gemini(prompt: str) -> str:
     """Gemini API'yi çağır, HTML brifing yanıtını döndür.
 
     Katmanlı dayanıklılık:
-      1) Geçici hata (503/500/ağ) → aynı modelde kısa beklemeyle tekrar dene
-      2) Kota dolu / model yok / geçici hata sürüyor → yedek modele geç
-      3) Anahtar/istek hatası (kalıcı) → hemen dur (hiçbir şey düzeltmez)
+      1) Kalıcı hata (API anahtarı/istek geçersiz) → hemen dur (hiçbir şey düzeltmez)
+      2) Kota dolu / model yok → hemen yedek modele geç (retry anlamsız)
+      3) Uzun süre asılı kalıp koptu (bkz. _HANG_THRESHOLD_SECONDS) → aynı
+         modeli TEKRAR DENEMEDEN yedek modele geç (paylaşılan bütçeyi korur)
+      4) Hızlı geçici hata (anlık 503/500/ağ) → aynı modelde kısa beklemeyle
+         tekrar dene, tükenirse yedek modele geç
     """
     # API key'i ortam değişkeninden oku (.env'den geldi)
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -1393,6 +1426,7 @@ def analyze_with_gemini(prompt: str) -> str:
                 raise RuntimeError(
                     "Gemini API: toplam süre bütçesi doldu"
                 ) from last_error
+            attempt_start = time.monotonic()
             try:
                 response = client.models.generate_content(
                     model=model,
@@ -1406,6 +1440,7 @@ def analyze_with_gemini(prompt: str) -> str:
                     log.warning("Brifing YEDEK model ile üretildi: %s", model)
                 return response.text
             except Exception as exc:
+                elapsed = time.monotonic() - attempt_start
                 last_error = exc
                 kind = _classify_error(exc)
 
@@ -1424,7 +1459,18 @@ def analyze_with_gemini(prompt: str) -> str:
                     )
                     break  # iç döngüden çık → sıradaki model
 
-                # Geçici hata → kısa bekle ve aynı modelde tekrar dene
+                # Deneme uzun süre ASILI KALDIKTAN SONRA başarısız olduysa
+                # (bkz. _HANG_THRESHOLD_SECONDS yorumu) aynı modeli TEKRAR
+                # DENEME — paylaşılan bütçeyi boşa harcamadan direkt yedeğe geç.
+                if elapsed >= _HANG_THRESHOLD_SECONDS:
+                    log.warning(
+                        "Model '%s' %.0f sn asılı kaldıktan sonra koptu — "
+                        "aynı model tekrar denenmeyecek, yedeğe geçiliyor: %s",
+                        model, elapsed, exc,
+                    )
+                    break  # iç döngüden çık → sıradaki model
+
+                # Hızlı geçici hata (ör. anlık 503) → kısa bekle ve aynı modelde tekrar dene
                 if attempt < max_attempts:
                     wait = _TRANSIENT_BACKOFF[attempt - 1]
                     log.warning(
