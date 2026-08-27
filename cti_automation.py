@@ -255,10 +255,9 @@ FEEDS = [
     ("Tenable Blog", "https://www.tenable.com/blog/feed"),
     ("GreyNoise Blog", "https://www.greynoise.io/blog/rss.xml"),
     ("Exploit-DB", "https://www.exploit-db.com/rss.xml"),
-    # ── Ürün-özel kaynaklar (SAP, WordPress, Sophos, PHP envanterde var) ──
+    # ── Ürün-özel kaynaklar (SAP, Sophos, PHP envanterde var) ──
     ("Onapsis (SAP Güvenliği)", "https://onapsis.com/feed/"),
     ("SecurityBridge (SAP)", "https://securitybridge.com/feed/"),
-    ("Wordfence (WordPress)", "https://www.wordfence.com/feed/"),
     ("PHP Releases", "https://www.php.net/feed.atom"),
     ("Sophos News", "https://news.sophos.com/en-us/category/security-operations/feed/"),
     # The Register (theregister.com/security/headlines.atom) aday olarak
