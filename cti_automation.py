@@ -1326,9 +1326,19 @@ def _classify_error(exc: Exception) -> str:
 # modellerle yenilendi (API'den canlı olarak doğrulandı). Modeller Google
 # tarafından emekliye ayrıldığı için bu liste yılda birkaç kez kontrol edilmeli:
 #   client.models.list() → generateContent destekleyenleri listeler.
+#
+# 2026-08-27 (aynı gün, ikinci geçiş): gemini-3.7-flash zincire eklendi —
+# client.models.list() ile bu tarihte en yeni GA flash model olduğu, ve
+# ai.google.dev/gemini-api/docs/deprecations sayfasında 3.5/3.6/3.7-flash
+# için "No shutdown date announced" olduğu doğrulandı (2.0-flash ailesinin
+# TAMAMI 1 Haziran 2026'da kapatılmış — üstteki arızanın kök nedeni).
+# gemini-flash-latest şu an 3.7-flash'a çözülüyor; yine de son halka olarak
+# kalıyor çünkü Google yeni bir GA model çıkardığında bu isim otomatik
+# günceli takip eder, listedeki sabit isimler etmez.
 _MODEL_CHAIN = (
-    "gemini-3.5-flash",
+    "gemini-3.7-flash",
     "gemini-3.6-flash",
+    "gemini-3.5-flash",
     "gemini-2.5-flash",
     "gemini-flash-latest",  # Google'ın güncel flash takma adı — son çare
 )
