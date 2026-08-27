@@ -1112,27 +1112,82 @@ def _is_specific_name(name: str) -> bool:
     )
 
 
+# Jenerik bir ürün adının hemen ardından (~20 karakter içinde) bir sürüm
+# numarası gelmesi ("PHP 8.3.12", "Apache 2.4.67"), o haberin GERÇEKTEN
+# o ürünün kendisiyle ilgili olduğuna dair güçlü bir sinyaldir.
+_NEARBY_VERSION_RE = re.compile(rf"\s{{0,20}}{_VER_LOOSE}")
+
+
+def _has_nearby_version(text: str, pattern: re.Pattern) -> bool:
+    """`pattern`'ın metindeki herhangi bir geçişinin hemen ardından bir
+    sürüm numarası var mı? (bkz. _NEARBY_VERSION_RE yorumu)
+    """
+    return any(
+        _NEARBY_VERSION_RE.match(text, m.end())
+        for m in pattern.finditer(text)
+    )
+
+
+# Zafiyet SINIFI adları: jenerik bir ürün adının hemen ardından bunlardan
+# biri geliyorsa ("PHP Object Injection", "SQL Injection"), o ürün adı
+# orada bir DİL/PLATFORM niteleyicisi olarak kullanılıyordur — advisory'nin
+# KONUSU o ürün değil, adı geçen BAŞKA bir yazılımdaki (genelde bir WordPress
+# eklentisi) bir kusurun CWE tipidir. Bu ifadeler VulDB/cvefeed gibi
+# kaynaklarda HER ZAMAN başlığın kendisinde geçtiği için, salt "başlıkta
+# geçiyor" kontrolü bunları elemeye yetmiyordu (2026-08-27: "php" ile
+# eşleşen 4 haberin 4'ü de bu desendi, ilgisiz WordPress eklenti zafiyetiydi).
+_VULN_CLASS_PHRASES = (
+    "object injection", "sql injection", "code injection", "command injection",
+    "cross-site scripting", "cross site scripting", "remote file inclusion",
+    "local file inclusion", "path traversal", "directory traversal",
+    "server-side request forgery", "cross-site request forgery",
+    "deserialization", "type juggling", "template injection",
+    "xml external entity", "ldap injection", "header injection",
+)
+_VULN_CLASS_RE = re.compile(
+    r"\s{0,3}(?:" + "|".join(re.escape(p) for p in _VULN_CLASS_PHRASES) + ")",
+    re.IGNORECASE,
+)
+
+
+def _title_match_is_genuine(norm_title: str, pattern: re.Pattern) -> bool:
+    """Başlıkta jenerik ad geçiyor VE bu geçiş bir zafiyet sınıfı
+    ifadesinin (bkz. _VULN_CLASS_PHRASES) parçası DEĞİL mi?
+
+    Aynı başlıkta hem "gerçek" hem "sınıf-adı" kullanımı bir arada olabilir
+    (nadir) — o yüzden İLK eşleşmede değil, HERHANGİ bir eşleşmede genuine
+    olan varsa kabul edilir.
+    """
+    for m in pattern.finditer(norm_title):
+        if _VULN_CLASS_RE.match(norm_title, m.end()) is None:
+            return True
+    return False
+
+
 def _find_product(text: str, norm_title: str,
                   patterns: list[tuple[str, re.Pattern]]) -> str | None:
     """Metinde eşleşen en spesifik ürün adını bul.
 
     patterns UZUNDAN KISAYA sıralı gelir; ilk eşleşme en spesifik olandır.
-    Jenerik (tek kelimelik, kısa) adlar yalnızca başlıkta geçiyorsa veya
-    metinde somut bir CVE varsa kabul edilir — aksi halde geçici aday
-    olarak tutulur ve daha iyi bir eşleşme çıkmazsa elenir.
+    Jenerik (tek kelimelik, kısa) adlar İKİ durumdan birinde kabul edilir:
+      - bir sürüm numarasıyla BİTİŞİK geçiyorsa (bkz. _has_nearby_version), VEYA
+      - başlıkta, bir zafiyet SINIFI ifadesinin parçası OLMADAN geçiyorsa
+        (bkz. _title_match_is_genuine)
+    Aksi halde (bağlamsız, tek başına geçiş — ya da sadece bir zafiyet
+    sınıfının niteleyicisi olarak geçiş) reddedilir.
+
+    2026-08-27: Eskiden "metinde HERHANGİ bir CVE varsa kabul et" ve "başlıkta
+    HERHANGİ bir geçiş yeterli" gibi gevşek kurallar vardı; VulDB/cvefeed gibi
+    kaynaklar HER başlığa hem CVE numarası hem zafiyet sınıfı adını koyduğu
+    için bu kurallar pratikte hiçbir şeyi elemiyordu.
     """
-    weak_candidate = None
     for name, pattern in patterns:
         if not pattern.search(text):
             continue
-        if _is_specific_name(name) or pattern.search(norm_title):
+        if _is_specific_name(name):
             return name
-        if weak_candidate is None:
-            weak_candidate = name
-    # Jenerik ad sadece gövdede geçti: somut bir CVE varsa haber yine de
-    # o ürünle ilgili bir advisory olabilir; yoksa yanlış pozitiftir.
-    if weak_candidate and _CVE_RE.search(text):
-        return weak_candidate
+        if _has_nearby_version(text, pattern) or _title_match_is_genuine(norm_title, pattern):
+            return name
     return None
 
 
@@ -1143,7 +1198,8 @@ def match_articles(articles: list[dict]) -> list[dict]:
       1. Gürültü başlıklarını at (webinar/podcast/pazarlama)
       2. HIGH_SIGNAL kelime yoksa at (kelime sınırlı — "source" artık RCE değil)
       3. Ürün eşleştir: en SPESİFİK ad kazanır, tek kelimelik jenerik
-         adlar ek kanıt ister (bkz. _is_specific_name)
+         adlar ek kanıt ister (başlıkta geçmeli ya da bir sürüm numarasıyla
+         bitişik geçmeli — bkz. _find_product/_has_nearby_version)
       4. Yinelenenleri ele: başlık benzerliği + CVE örtüşmesi
       5. Öncelik puanı hesapla ve sırala
     """
