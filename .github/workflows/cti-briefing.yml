@@ -21,6 +21,19 @@ on:
     # her iki mevsimde de sifirlamadan SONRAYA denk gelir.
     - cron: '15 11 * * *'
       timezone: "Europe/Istanbul"
+    # YEDEK slot (18:00 Istanbul). 2026-08-28: GitHub Actions'in schedule
+    # tetikleyicisi bu repoda ilk gunden beri gecikiyor (once ~35-50 dk,
+    # sonra 11-12 saate cikti) ve bir gun HIC tetiklenmedi. Bu, GitHub'in
+    # kendi actions/runner#4468 numarali, halen ACIK ve cozulmemis platform
+    # hatasiyla birebir ortusuyor ("continuously increasing drift in
+    # scheduled workflow") -- bizim kodumuzda/config'imizde bir hata degil.
+    # Cozum: TEK bir cron slotuna guvenmek yerine, ayni gun icinde BAGIMSIZ
+    # ikinci bir slot daha tanimliyoruz. Asagidaki "Bugun zaten gonderildi
+    # mi kontrol et" adimi, birincisi zaten basariyla gitmisse bunun mail
+    # atmasini engeller -- iki slotun AYNI ANDA gecikme/dusme ihtimali tek
+    # slottan cok daha dusuk.
+    - cron: '00 15 * * *'
+      timezone: "Europe/Istanbul"
   # Actions sekmesinden "Run workflow" butonu ile elle de calistirilabilir
   workflow_dispatch:
     inputs:
@@ -47,22 +60,53 @@ jobs:
     # toplam Gemini butcesi 15 dk. Feed cekme + gorsel isleme ile birlikte en
     # kotu senaryo ~19 dk'ya ulasiyor, 20 dk'lik limit buna cok yakindi.
     timeout-minutes: 30
+    # "Bugun zaten gonderildi mi" kontrolu icin bu job'a ozel actions:read
+    # yetkisi (gh run list). Ust duzey permissions bilerek sadece contents:
+    # read tutuluyor, burada SADECE bu job icin genisletiliyor.
+    permissions:
+      contents: read
+      actions: read
 
     steps:
       - name: Repoyu indir
         uses: actions/checkout@v7
 
+      # Iki bagimsiz schedule slotu var (bkz. yukaridaki "on.schedule" yorumu).
+      # Biri zaten basariyla mail attiysa digeri SESSIZCE atlanir -- ayni gun
+      # iki kez brifing gitmesin. Sadece schedule tetiklemesinde calisir;
+      # elle tetikleme (workflow_dispatch) HER ZAMAN calisir.
+      - name: Bugun zaten basariyla gonderildi mi kontrol et
+        id: dedup
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bugun=$(date -u +%F)
+          sayi=$(gh run list --repo "${{ github.repository }}" \
+            --workflow cti-briefing.yml --event schedule --status success \
+            --json createdAt --jq "[.[] | select(.createdAt | startswith(\"$bugun\"))] | length")
+          echo "Bugun ($bugun) basarili schedule calismasi sayisi: $sayi"
+          if [ "$sayi" -gt 0 ]; then
+            echo "::notice::Bugun zaten basariyla gonderildi, bu calistirma atlaniyor."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Python kur
+        if: steps.dedup.outputs.skip != 'true'
         uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: 'pip'   # bagimliliklari onbellekle (kurulum hizlanir)
 
       - name: Bagimliliklari yukle
+        if: steps.dedup.outputs.skip != 'true'
         run: pip install -r requirements.txt
 
       # Secret eksikse anlasilir hata ver (yoksa kod tuhaf sekilde patlar)
       - name: Secret kontrolu
+        if: steps.dedup.outputs.skip != 'true'
         env:
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
           SMTP_USERNAME:       ${{ secrets.SMTP_USERNAME }}
@@ -84,6 +128,7 @@ jobs:
           echo "✓ Tum secret'lar tanimli"
 
       - name: Brifingi calistir
+        if: steps.dedup.outputs.skip != 'true'
         env:
           # Gizli degerler — GitHub Secrets'tan gelir, loglarda otomatik maskelenir
           GEMINI_API_KEY:      ${{ secrets.GEMINI_API_KEY }}
