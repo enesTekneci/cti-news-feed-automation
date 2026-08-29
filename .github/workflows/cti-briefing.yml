@@ -15,23 +15,31 @@ name: CTI Tehdit Brifingi
 
 on:
   schedule:
-    # Her gun 11:15 Istanbul saati. "timezone" anahtari sayesinde yaz/kis saati
-    # otomatik ayarlanir (UTC hesabi yapmaya gerek yok).
-    # 11:15 secimi: Gemini kotasi gece yarisi Pasifik'te sifirlanir; bu saat
-    # her iki mevsimde de sifirlamadan SONRAYA denk gelir.
-    - cron: '15 11 * * *'
+    # Birincil slot: 08:15 Istanbul. 2026-08-29: bilerek Gemini kota
+    # sifirlamasindan (Pasifik gece yarisi = kisin 11:00, yazin 10:00
+    # Istanbul) ONCEYE cekildi -- GitHub'in schedule gecikmesini (asagida)
+    # telafi etmek icin. Billing KAPALI, 20 RPD/gun limiti hala gecerli;
+    # kisin bu slot nadiren onceki gunun (agir manuel test gunlerinde
+    # tukenmis) kotasina denk gelebilir. Bu kabul edilebilir cunku:
+    #   1) _MODEL_CHAIN'deki 5 modelin HER BIRININ AYRI kotasi var,
+    #   2) asagidaki YEDEK slot (15:00) sifirlamadan HER ZAMAN sonradir,
+    #      yani birincisi kota yuzunden hic mail atamasa bile ikincisi
+    #      calisir. Detay: [[cti-news-feed-automation]] hafiza notu.
+    - cron: '15 8 * * *'
       timezone: "Europe/Istanbul"
-    # YEDEK slot (18:00 Istanbul). 2026-08-28: GitHub Actions'in schedule
-    # tetikleyicisi bu repoda ilk gunden beri gecikiyor (once ~35-50 dk,
-    # sonra 11-12 saate cikti) ve bir gun HIC tetiklenmedi. Bu, GitHub'in
-    # kendi actions/runner#4468 numarali, halen ACIK ve cozulmemis platform
-    # hatasiyla birebir ortusuyor ("continuously increasing drift in
-    # scheduled workflow") -- bizim kodumuzda/config'imizde bir hata degil.
-    # Cozum: TEK bir cron slotuna guvenmek yerine, ayni gun icinde BAGIMSIZ
-    # ikinci bir slot daha tanimliyoruz. Asagidaki "Bugun zaten gonderildi
-    # mi kontrol et" adimi, birincisi zaten basariyla gitmisse bunun mail
-    # atmasini engeller -- iki slotun AYNI ANDA gecikme/dusme ihtimali tek
-    # slottan cok daha dusuk.
+    # YEDEK slot (15:00 Istanbul, kota sifirlamasindan HER ZAMAN sonra).
+    # 2026-08-28: GitHub Actions'in schedule tetikleyicisi bu repoda ilk
+    # gunden beri gecikiyor (once ~35-50 dk, sonra 11-12 saate cikti) ve
+    # bir gun HIC tetiklenmedi. Bu, GitHub'in kendi actions/runner#4468
+    # numarali, halen ACIK ve cozulmemis platform hatasiyla birebir
+    # ortusuyor ("continuously increasing drift in scheduled workflow")
+    # -- bizim kodumuzda/config'imizde bir hata degil, timezone anahtarini
+    # kaldirmak da cozmuyor (referans vakada duz UTC cron'da da ayni sorun
+    # var). Cozum: TEK bir cron slotuna guvenmek yerine, ayni gun icinde
+    # BAGIMSIZ ikinci bir slot daha tanimliyoruz. Asagidaki "Bugun zaten
+    # gonderildi mi kontrol et" adimi, birincisi zaten basariyla gitmisse
+    # bunun mail atmasini engeller -- iki slotun AYNI ANDA gecikme/dusme
+    # ihtimali tek slottan cok daha dusuk.
     - cron: '00 15 * * *'
       timezone: "Europe/Istanbul"
   # Actions sekmesinden "Run workflow" butonu ile elle de calistirilabilir
@@ -39,6 +47,10 @@ on:
     inputs:
       dry_run:
         description: "Dry run: mail GONDERME, sadece onizlemeyi artifact olarak uret"
+        type: boolean
+        default: false
+      force_send:
+        description: "Bugun zaten gonderilmis olsa bile zorla gonder (dedup kontrolunu atla)"
         type: boolean
         default: false
 
@@ -73,19 +85,38 @@ jobs:
 
       # Iki bagimsiz schedule slotu var (bkz. yukaridaki "on.schedule" yorumu).
       # Biri zaten basariyla mail attiysa digeri SESSIZCE atlanir -- ayni gun
-      # iki kez brifing gitmesin. Sadece schedule tetiklemesinde calisir;
-      # elle tetikleme (workflow_dispatch) HER ZAMAN calisir.
+      # iki kez brifing gitmesin. 2026-08-29: elle tetikleme (workflow_dispatch)
+      # de bu kontrole tabi -- daha once (27 Agustos) test amacli elle
+      # tetikleme, ayni gun ikinci bir GERCEK mail gitmesine sebep olmustu.
+      # Istisnalar: dry_run (mail zaten atilmiyor, kontrole gerek yok) ve
+      # force_send (bilerek/acikca "yine de gonder" denildiginde).
       - name: Bugun zaten basariyla gonderildi mi kontrol et
         id: dedup
-        if: github.event_name == 'schedule'
+        if: >-
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.force_send)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # "Gerçek gönderim" tanımı (bkz. CONTEXT.md): schedule-tetikli her
+          # başarılı çalışma her zaman gerçektir (schedule'da dry_run hiç
+          # yok). workflow_dispatch için ise, dry-run'lar başarıyla bittiğinde
+          # "Dry run onizlemesini yukle" adımını çalıştırır (gerçek gönderimde
+          # bu adım "skipped" kalır) -- bu yüzden o adımın sonucuna bakarak
+          # ayırt ediyoruz, inputs'u geriye dönük sorgulayamadığımız için.
           bugun=$(date -u +%F)
-          sayi=$(gh run list --repo "${{ github.repository }}" \
-            --workflow cti-briefing.yml --event schedule --status success \
-            --json createdAt --jq "[.[] | select(.createdAt | startswith(\"$bugun\"))] | length")
-          echo "Bugun ($bugun) basarili schedule calismasi sayisi: $sayi"
+          repo="${{ github.repository }}"
+          ids=$(gh run list --repo "$repo" --workflow cti-briefing.yml --status success \
+            --json databaseId,createdAt --jq "[.[] | select(.createdAt | startswith(\"$bugun\"))] | .[].databaseId")
+          sayi=0
+          for id in $ids; do
+            dry=$(gh run view "$id" --repo "$repo" --json jobs \
+              --jq '[.jobs[].steps[]? | select(.name=="Dry run onizlemesini yukle") | .conclusion] | first // "skipped"')
+            if [ "$dry" != "success" ]; then
+              sayi=$((sayi + 1))
+            fi
+          done
+          echo "Bugun ($bugun) başarılı GERÇEK gönderim sayısı: $sayi"
           if [ "$sayi" -gt 0 ]; then
             echo "::notice::Bugun zaten basariyla gonderildi, bu calistirma atlaniyor."
             echo "skip=true" >> "$GITHUB_OUTPUT"
