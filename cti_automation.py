@@ -16,20 +16,20 @@ analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
 import locale
 import os
 import re
-import json                          # Envanter/alias listelerini env'den yükleme
-import html                          # HTML escape (XSS koruması için)
+import json                          # Envanter/alias + Gemini JSON çıktısı
+import html                          # HTML escape (model çıktısı için ZORUNLU)
 import logging
 import logging.handlers              # RotatingFileHandler (log boyut sınırı)
 import smtplib                       # SMTP ile e-posta gönderme
 import ssl                           # STARTTLS bağlantısı
-import time                          # exponential backoff retry
+import threading                     # Haber-başına analiz worker'ları
+import time                          # Hız sınırı / süre bütçesi
 import urllib.parse                  # URL resolve için
 from io import BytesIO               # Bellekte görsel işlemek için
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.image import MIMEImage
-from html.parser import HTMLParser   # Gemini HTML çıktısını sanitize
 from concurrent.futures import ThreadPoolExecutor, as_completed  # Paralel RSS çekme
 from pathlib import Path
 
@@ -86,50 +86,70 @@ log = logging.getLogger("cti")
 
 # ── Gemini analiz limitleri ───────────────────────────────────────────────────
 # Tüm limitler tek noktadan yönetilir — gerekirse buradan ayarla.
-MAX_GEMINI_ARTICLES = 50       # Gemini'ye gönderilecek maks makale sayısı
-MAX_BODY_CHARS      = 10_000   # Makale sayfasından çekilecek maks metin (versiyon çıkarma)
-GEMINI_BODY_CHARS   = 3_000    # Gemini prompt'una gönderilecek makale bağlamı
-MAX_PROMPT_TOKENS   = 100_000  # Toplam prompt token üst sınırı (TPM güvenlik payı)
+MAX_GEMINI_ARTICLES = 50       # Derin analiz yapılacak maks makale sayısı
+MAX_BODY_CHARS      = 10_000   # Makale sayfasından çekilecek maks metin
+# Haber BAŞINA yapılan analizde modele verilen makale bağlamı. Eskiden 50 haber
+# TEK prompt'a sığdığı için 3.000 karakterle sınırlıydı; artık her haber kendi
+# isteğine sahip olduğundan tam metni (MAX_BODY_CHARS) verebiliyoruz — sürüm
+# bilgisi çoğu advisory'de metnin ilerleyen kısımlarında geçtiği için bu
+# doğrudan analiz kalitesini artırır.
+GEMINI_BODY_CHARS   = MAX_BODY_CHARS
 MAX_DOWNLOAD_BYTES     = 2_000_000   # İndirme tavanı (optimizasyon öncesi)
 IMAGE_TARGET_WIDTH     = 1280        # 640px görüntüleme × 2 (retina)
 IMAGE_JPEG_QUALITY     = 85
 MAX_TOTAL_IMAGE_BYTES  = 5_000_000   # Tüm görsellerin toplam tavanı
 IMAGE_FETCH_TIMEOUT    = 8
-# Gemini isteğinin azami süresi (ms). google-genai'nin kendisi hiç timeout
-# koymuyor — yüksek yoğunlukta istek yanıtsız asılı kalabilir (20 dk+),
-# bu durumda script-içi retry/model-fallback mantığına HİÇ sıra gelmez
-# (istisna fırlamadığı için yakalanamaz). Bu sınır olmadan tek bir asılı
-# istek, GitHub Actions'ın job timeout'una çarpıp brifingi iptal ettirebilir
-# (2026-08-22'de yaşandı).
+# ── Haber-başına (fan-out) analiz ────────────────────────────────────────────
+# 2026-09-10 MİMARİ DEĞİŞİKLİĞİ: Eskiden 50 haber TEK prompt'ta analiz ediliyordu.
+# Bu, "attention dilution" denen bilinen bir kalite sorununa yol açıyordu — model
+# dikkat bütçesini 50 habere bölüştürdüğü için her haberin özeti ve sürüm alanları
+# sığ kalıyordu. Map-reduce literatürünün tam olarak tarif ettiği durum:
+#   "each document gets focused scrutiny in the map phase — the LLM isn't
+#    competing 50 documents for attention. Senior teams use this not just for
+#    scale but for CORRECTNESS."
+# Artık her haber KENDİ isteğinde analiz ediliyor (map fazı). Klasik map-reduce'un
+# darboğazı olan "reduce" LLM çağrısı bizde YOK: çapraz-haber dedup zaten kodda
+# (CVE + başlık benzerliği) yapılıyor, sıralama da severite'ye göre mekanik.
 #
-# 2026-08-27: 90 sn'lik eski değer ÇOK DÜŞÜKTÜ ve brifingi tamamen düşürüyordu.
-# Ölçüm (43 makale, ~120 KB prompt, ~57 KB HTML çıktı):
-#     gemini-3.5-flash → 280,6 sn        gemini-2.5-flash → 133,3 sn
-# Yani model doğru çalışırken bile her istek 90 sn'de kesiliyor, üç model de
-# 504 veriyor ve "tüm modeller başarısız" hatasıyla mail hiç gitmiyordu.
-# 360 sn: ölçülen en yavaş yanıtın (~281 sn) belirgin üstünde, sonsuzdan uzak.
-GEMINI_REQUEST_TIMEOUT_MS = 360_000
-
-# Tüm model zincirinin (retry'lar dahil) toplam süre bütçesi (saniye).
-# Tek istek sınırını yükseltmek tek başına yetmez: 4 model × 3 deneme ×
-# 360 sn = 72 dakika eder ve job timeout'unu yine patlatır. Bu bütçe,
-# zincirin ne kadar uzarsa uzasın toplamda sınırlı kalmasını garanti eder.
-#
-# 2026-08-27: 900 sn (15 dk) yetersiz çıktı — analyze_with_gemini()'deki
-# _HANG_THRESHOLD_SECONDS yorumuna bak: bir model art arda 2 kez ~300 sn
-# asılı kalıp koptu, bütçenin çoğu (2×300 sn + backoff) TEK modelde tükendi
-# ve zincir sağlıklı olan yedek modele hiç ulaşamadı (workflow run
-# 33064763459, mail gitmedi). O sorun asıl olarak retry mantığındaki
-# tasarım hatasıydı (aynı asılı modeli tekrar tekrar denemek) ve ayrıca
-# düzeltildi. Bütçe yine de 1200 sn'ye (20 dk) çıkarıldı: 30 dk'lık job
-# timeout'u içinde rahatça sığıyor (feed çekme + görsel işleme ~2-3 dk,
-# mail gönderme saniyeler sürüyor) ve artık israf edilmeyen bu süre,
-# gerçekten birden fazla modelin aynı anda dalgalandığı nadir durumlarda
-# zincirin daha derinlerine inebilmeyi sağlıyor.
-GEMINI_TOTAL_BUDGET_SEC = 1200
-# Token matematiği (50 makale × ~900 token/makale ≈ 45K token):
-#   Günlük bütçe: 250K → %18 kullanım. TPM: tek istek/gün, aşım riski yok.
-#   Makale sayısı artarsa body_chars dinamik olarak kısılır (build_prompt içinde).
+# Kota matematiği (ücretsiz katman, her modelin AYRI kotası var):
+#   Model başına 5 RPM / 20 RPD / 250K TPM. 4 model → 80 RPD kapasite, ~20 RPM.
+#   50 makale = 50 istek → kapasitenin ~%62'si, retry/manuel çalıştırma payı kalır.
+#   Ölçülen tek makale analizi: ~4-5 sn → 4 paralel model ile 50 makale ~1 dk.
+# Birincil havuz — analiz kalitesi burada en yüksek. Normal bir günde (50 makale)
+# yalnızca bunlar kullanılır: 5 model × 20 RPD = 100 istek kapasite.
+ANALYSIS_MODELS = (
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+)
+# Yedek havuz — SADECE birincil havuzun kotası tükenip hâlâ analiz bekleyen
+# makale kaldığında devreye girer. "lite" modeller daha sığ analiz üretir,
+# bu yüzden normal günlerde hiç kullanılmazlar; amaçları, yoğun bir günde
+# (veya 503 fırtınasında retry'ler kotayı yakınca) haberlerin analizsiz
+# kalmasındansa biraz daha sığ analiz almalarını sağlamak.
+# 2026-09-10'da bu ihtiyaç gerçek oldu: 4 modelin de günlük kotası dolunca
+# 34 makalenin 14'ü analizsiz kaldı.
+FALLBACK_MODELS = (
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+)
+MODEL_RPM = 5                              # Ücretsiz katmanda model başına dakikalık istek
+_MODEL_MIN_INTERVAL = 60.0 / MODEL_RPM     # Aynı modelde iki istek arası asgari saniye
+# Bir makale en fazla kaç kez denenir. Sınırsız bırakılırsa, sürekli 503 alan
+# TEK bir makale kuyrukta dönüp durur ve diğer makalelerin payına düşen günlük
+# kotayı yer (2026-09-10 dry-run'ında bir haber 6 kez denendi).
+MAX_ATTEMPTS_PER_ARTICLE = 3
+# Tek makale analizi küçük bir istek (~4K token girdi, ~400 token çıktı) ve
+# ölçümde ~4-5 sn sürüyor. 120 sn, en yavaş gözlemlenen yanıtın çok üstünde
+# ama asılı kalan bir isteğin tüm bütçeyi yemesine izin vermeyecek kadar dar.
+ARTICLE_TIMEOUT_MS = 120_000
+# Tüm fan-out'un toplam süre bütçesi (saniye). Bu süre dolduğunda kalan
+# makaleler analiz edilmeden taşma tablosuna düşer — brifing yine gider.
+# 30 dk'lık GitHub Actions job limitinin içinde rahatça kalır.
+ANALYSIS_TOTAL_BUDGET_SEC = 900
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  INVENTORY
@@ -450,65 +470,77 @@ def score_article(text: str, title: str = "", matched_product: str = "") -> int:
 VENDOR_ALIASES = _load_json_env("VENDOR_ALIASES_JSON", "vendor alias eşleştirme tablosu")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  GEMINI SYSTEM PROMPT
-#  Gemini'ye verilen rol tanımı ve çıktı şablonu.
-#  Türkçe HTML brifing üretir: tarih, kaynak, etkilenen/yamalı sürümler,
-#  özet, aksiyon, öneri. Severite (YÜKSEK/ORTA/DÜŞÜK) renkli işaretlenir.
+#  GEMINI — HABER BAŞINA ANALİZ
+#  Model artık HTML üretmiyor; SADECE yapılandırılmış veri (JSON) döndürüyor.
+#  HTML'i render_briefing_block() üretir. Bunun üç somut faydası var:
+#    1) XSS yüzeyi yok — model çıktısı hiçbir zaman HTML olarak yorumlanmıyor,
+#       her alan html.escape()'ten geçip kendi şablonumuza yerleşiyor.
+#       (Eski whitelist tabanlı HTML sanitizer'ı tamamen gereksiz kıldı.)
+#    2) Format tutarlılığı garanti — model bazen <p> unutuyor, bazen fazladan
+#       giriş cümlesi yazıyordu; artık bunlar yapısal olarak imkânsız.
+#    3) Sürüm alanları TEST EDİLEBİLİR veri — HTML'den regex ile geri
+#       ayıklamaya gerek yok.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-SYSTEM_PROMPT = """Sen kıdemli bir Siber Tehdit İstihbaratı (CTI) Analistsin ve bir güvenlik operasyonları ekibine doğrudan danışmanlık yapıyorsun.
+SEVERITE_RENK = {"YÜKSEK": "#dc3545", "ORTA": "#fd7e14", "DÜŞÜK": "#28a745"}
 
-Sana numaralandırılmış bir güvenlik haberleri listesi verilecek. Her haber, ortamımızdaki bir ürünle eşleştirilmiş olacak.
+# Gemini structured-output şeması. response_schema ile birlikte verildiğinde
+# model bu alanların DIŞINA çıkamaz ve eksik alan döndüremez.
+ANALYSIS_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "severite": {"type": "STRING", "enum": ["YÜKSEK", "ORTA", "DÜŞÜK"]},
+        "etkilenen_surumler": {"type": "STRING"},
+        "yamali_surumler": {"type": "STRING"},
+        "etkilenen_kapsam": {"type": "STRING"},
+        "ozet": {"type": "STRING"},
+        "olay_tarihi": {"type": "STRING"},
+        "aksiyon": {"type": "STRING"},
+        "oneri": {"type": "STRING"},
+    },
+    "required": [
+        "severite", "etkilenen_surumler", "yamali_surumler",
+        "etkilenen_kapsam", "ozet", "aksiyon", "oneri",
+    ],
+}
 
-HER HABER İÇİN aşağıdaki HTML formatında bir brifing bloğu yaz:
+# NOT — sürüm çıkarma hakkında: Burada modele BİLEREK hiçbir regex/biçim kuralı
+# verilmiyor. Eskiden kod, metinden regex ile sürüm çekip ("Detected Versions")
+# modele ipucu olarak veriyordu ve modelden bu işaretleri yorumlamasını
+# istiyordu; buna rağmen sürüm alanları sürekli eksik kalıyordu çünkü regex
+# her advisory biçimini yakalayamıyordu. Artık modelin TAM makale metnini
+# görüp sürümleri kendi bağlam anlayışıyla çıkarması isteniyor — dil modelinin
+# regex'ten yapısal olarak daha iyi olduğu iş tam olarak budur.
+SYSTEM_PROMPT = """Sen kıdemli bir Siber Tehdit İstihbaratı (CTI) analistisin ve bir güvenlik operasyonları ekibine danışmanlık yapıyorsun.
 
-<div style="margin-bottom:24px;padding:16px;border-left:4px solid [SEVERİTE_RENK];background:#f9f9f9;font-family:Arial,sans-serif;">
-  <h3 style="margin:0 0 8px 0;color:[SEVERİTE_RENK];">[SEVERİTE: YÜKSEK/ORTA/DÜŞÜK] Haber Başlığı</h3>
-  [[IMG:n]]
-  <p><strong>📅 Haber Tarihi:</strong> Yayın tarihi</p>
-  <p><strong>💾 Eşleşen Ürün:</strong> matched_product değeri</p>
-  <p><strong>🔴 Etkilenen Sürümler:</strong> Zafiyetten etkilenen (savunmasız) versiyon numaraları/aralıkları</p>
-  <p><strong>🟢 Yamalı Sürümler:</strong> Yamayı içeren güvenli versiyon numaraları (yükseltme hedefi)</p>
-  <p><strong>🎯 Etkilenen:</strong> Etkilenen yazılım, donanım veya gruplar</p>
-  <p><strong>📝 Özet:</strong> Temel tehdit veya sorunu 25 kelimede özetle</p>
-  <p><strong>🛡️ Aksiyon:</strong> Doğrudan talimat</p>
-  <p><strong>💡 Öneri:</strong> Bir stratejik tavsiye</p>
-  <p style="margin:16px 0 0;text-align:center;">
-    <a href="LINK" style="display:inline-block;padding:10px 22px;background:#1a1a2e;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:bold;font-size:13px;">Habere Git →</a>
-  </p>
-</div>
+Sana TEK bir güvenlik haberi verilecek: başlığı, yayın tarihi, ortamımızdaki hangi ürünle eşleştiği ve makalenin tam metni. Bu haberi derinlemesine analiz edip verilen JSON şemasına göre yanıt ver.
 
-SEVERİTE_RENK: YÜKSEK=#dc3545, ORTA=#fd7e14, DÜŞÜK=#28a745
+ALANLAR:
+
+severite — Tehdidin bizim ortamımız için aciliyeti:
+  YÜKSEK = aktif olarak istismar ediliyor / kritik RCE / veri ihlali / yama yok
+  ORTA   = yaması mevcut kritik açık / devam eden bir kampanya
+  DÜŞÜK  = potansiyel risk / bilgilendirme / öneri niteliğinde
+
+etkilenen_surumler — Zafiyetten ETKİLENEN (savunmasız) sürümler. Makale metnini dikkatle oku ve sürüm bilgisini KENDİN çıkar. Ürün adıyla birlikte, insanın okuyacağı şekilde yaz (örn. "FortiOS 7.4.0 – 7.4.6 ve 7.2.0 – 7.2.10", "PAN-OS 11.2.4'ten önceki tüm sürümler"). Birden fazla ürün dalı etkileniyorsa hepsini yaz. Metinde sürüm gerçekten geçmiyorsa: "Belirtilmemiş — kaynağı kontrol edin".
+
+yamali_surumler — Yamayı içeren GÜVENLİ sürümler, yani yükseltme hedefi (örn. "FortiOS 7.4.7 ve 7.2.11", "Windows: KB5031354"). Microsoft ürünlerinde yamanın kimliği sürüm numarası değil KB numarasıdır, varsa onu yaz. Yama henüz yayınlanmadıysa bunu açıkça belirt.
+
+etkilenen_kapsam — Etkilenen yazılım/donanım/kullanıcı grubu, kısa bir ifadeyle.
+
+ozet — Tehdidin ÖZÜ. En fazla 40 kelime. Neyin, nasıl istismar edildiğini ve bizim için neden önemli olduğunu somut yaz. Genel geçer ifadelerden ("güvenlik açığı tespit edildi") kaçın; saldırı vektörünü ve etkisini söyle.
+
+olay_tarihi — Zafiyetin istismar edildiği/keşfedildiği veya olayın gerçekleştiği SPESİFİK tarih, metinde geçiyorsa. Bu, haberin YAYIN tarihi DEĞİLDİR. Türkçe yaz (örn. "15 Ağustos 2026") ve ozet alanında da AYNEN bu şekilde geçir. Metinde böyle bir tarih yoksa boş string döndür — ASLA tarih uydurma.
+
+aksiyon — Güvenlik ekibinin ŞİMDİ yapması gereken somut, emir kipinde talimat (örn. "FortiOS'u 7.4.7'ye yükselt"). Somut bir aksiyon yoksa: "Güncellemeleri takip et."
+
+oneri — Bu olaydan çıkarılacak bir stratejik tavsiye.
 
 KURALLAR:
-- Yanıtın tamamı TÜRKÇE olmalı. Teknik terimler, CVE numaraları, ürün isimleri ve komutlar İNGİLİZCE kalmalı.
-- Giriş veya sonuç cümlesi YAZMA. Doğrudan ilk brifing bloğuyla başla.
-- "Özet" 25 kelimeyi geçmemeli.
-- "Özet" içinde zafiyetin istismar edildiği, keşfedildiği veya olayın gerçekleştiği SPESİFİK bir tarih geçiyorsa (bu, haberin yayın tarihi DEĞİL — o "Haber Tarihi" alanında zaten var; burası olayın/istismarın kendi tarihi), bu tarihi <span style="color:#0d6efd;">...</span> ile SADECE RENKLİ yaz. KALIN YAPMA — <strong> veya <b> KULLANMA. Örnek: "Zafiyet <span style=\"color:#0d6efd;\">15 Ağustos 2026</span>'dan beri aktif istismar ediliyor." Böyle bir tarih geçmiyorsa bu kuralı uygulama, tarih uydurma.
-- "Aksiyon" imperatif ve doğrudan olmalı. Spesifik bir aksiyon yoksa: "Güncellemeleri takip et."
-- Her brifing bloğunda <h3> başlığının hemen altına tam olarak [[IMG:n]] yaz (n, o makalenin sana verilen numarasıdır, örneğin [[IMG:1]]). Görseli olsa da olmasa da bu token'ı mutlaka ekle.
-- Eğer iki haber aynı CVE veya olayı işliyorsa, ikincisi için yalnızca şunu yaz:
-  <div style="margin-bottom:24px;padding:12px;border-left:4px solid #6c757d;background:#f9f9f9;font-family:Arial,sans-serif;">
-    <p><strong>Aynı konu hakkında ek haber:</strong> İlk haberin başlığı</p>
-    <p style="margin:8px 0 0;text-align:center;">
-      <a href="LINK" style="display:inline-block;padding:6px 16px;border:1.5px solid #6c757d;color:#6c757d;text-decoration:none;border-radius:6px;font-weight:bold;font-size:12px;">Habere Git →</a>
-    </p>
-  </div>
-- Her haberde "Full Article Content" ve "Detected Versions" alanları verilmiştir. Versiyon bilgisini doldururken bu verileri DİKKATLİCE analiz et:
-  * "Detected Versions" listesindeki işaretler ANLAM taşır, bunları doğru yorumla:
-      "11.2.0 – 11.2.4-h16" = bu aralıktaki sürümler ETKİLENİYOR
-      "< 9.0.98"            = bu sürümden ÖNCEKİ her şey ETKİLENİYOR
-      "<= 20.1.0"           = bu sürüm DAHİL ve öncesi ETKİLENİYOR
-      ">= 7.4.7"            = bu sürüm ve sonrası GÜVENLİ (yamalı)
-      "fixed in 1.38.3"     = yamayı içeren sürüm, YÜKSELTME HEDEFİ
-      "11.2.x"              = o dalın tüm alt sürümleri
-      "KB5031354"           = Microsoft yama kimliği (sürüm yerine bunu yaz)
-  * "Etkilenen Sürümler" alanına YALNIZCA zafiyetten etkilenen (savunmasız) versiyonları yaz. Ürün adıyla birlikte yaz (örn. "PAN-OS 11.2.0 – 11.2.4-h16", "FortiOS < 7.4.7").
-  * "Yamalı Sürümler" alanına yamayı/düzeltmeyi içeren güvenli sürümleri yaz. Yükseltme hedefi olarak göster (örn. "PAN-OS >= 11.2.4-h17", "FortiOS 7.4.7 veya üzeri", "Windows: KB5031354").
-  * Birden fazla ürün dalı (branch) etkileniyorsa her dalı ayrı ayrı listele.
-  * "Affected/Unaffected" veya "before/prior to" gibi bağlamsal ipuçlarına dikkat et.
-  * Haberde hiçbir versiyon bilgisi gerçekten yoksa her iki alan için de "Belirtilmemiş — kaynağı kontrol edin" yaz.
-- SEVERİTE belirleme rehberi: YÜKSEK = aktif exploitation / kritik RCE / veri ihlali; ORTA = yaması mevcut kritik açık / aktif campaign; DÜŞÜK = potansiyel risk / öneri niteliğinde. Tüm haberleri yüksek SEVERİTE'den düşük SEVERİTE'ye doğru sırala. """
+- Yanıtın tamamı TÜRKÇE. Teknik terimler, CVE numaraları, ürün adları ve komutlar İNGİLİZCE kalır.
+- Sadece verilen makale metnine dayan. Metinde olmayan bir bilgiyi UYDURMA.
+- Tüm alanları doldur; bilgi yoksa alanın kendi kuralındaki "yok" ifadesini kullan."""
+
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -541,225 +573,29 @@ def norm(s: str) -> str:
     return _WHITESPACE.sub(" ", (s or "").lower()).strip()
 
 
-# ── Versiyon çıkarma ────────────────────────────────────────────────
-# Desenler canlı advisory metinleri (Fortinet/Cisco/Palo Alto PSIRT, CISA,
-# Ubuntu USN, Dell, cvefeed) taranarak çıkarıldı — tahminle değil.
+# ── Sürüm deseni (SADECE ürün eşleştirme için) ──────────────────────
+# NOT: Metinden sürüm ÇIKARMA işi 2026-09-10'da tamamen Gemini'ye devredildi
+# (bkz. SYSTEM_PROMPT yanındaki not) — _VERSION_RE, extract_versions(),
+# _FALSE_VERSION_RE ve MAX_VERSIONS silindi. Aşağıdaki desen sadece
+# _NEARBY_VERSION_RE için duruyor: jenerik bir ürün adının ("php") hemen
+# ardından sürüm numarası gelmesi, o haberin gerçekten o ürünle ilgili
+# olduğunu gösteren bir EŞLEŞME sinyalidir; sürüm bilgisinin kendisini
+# çıkarmak için kullanılmaz.
 #
 # Build/patch soneki: "-h5", "-h16-rc1" gibi. Tire sonrası HARF şartı var, bu yüzden
 # "7.0-7.6" gibi aralık ayırıcısı tire ile KARIŞMAZ (7 bir harf değil, sayı).
 _BUILD_SUFFIX = r"(?:-[a-zA-Z]+\d*)*"
-
-# İki bileşenli sürüm (7.4). YALNIZCA bir anahtar kelime bağlam verdiğinde
-# kullanılır ("versions 7.4 and earlier") — tek başına aranırsa CVSS puanları
-# (8.8, 9.1) ve tablo hücreleri sürüm sanılır.
 _VER_LOOSE = rf"\d+\.\d+(?:\.(?:\d+|[xX*]))*{_BUILD_SUFFIX}"
-# Üç+ bileşenli sürüm (7.4.2, 7.00.00.182, 7.4.x). Bağlamsız da güvenli.
-_VER_STRICT = rf"\d+\.\d+(?:\.(?:\d+|[xX*]))+{_BUILD_SUFFIX}"
-
-# NOT: Alternatif sırası ÖNEMLİ. Regex aynı konumda soldaki dalı seçer;
-# bu yüzden anlamı zenginleştiren dallar ("... and earlier", "fixed in ...")
-# sade "version X" dalından ÖNCE gelmeli. Aksi halde "versions 20.2 and prior"
-# ifadesinde sade dal "20.2"yi yutar ve "≤" anlamı kaybolur (eski davranış).
-_VERSION_RE = re.compile(
-    rf"""
-    # ①a "between 7.0.0 and 7.4.2" / "from 2.4.17 through 2.4.67"
-    #     "and" ayıracı YALNIZCA between/from öneki varken geçerli — aksi
-    #     halde "affects 1.2.3 and 4.5.6" gibi bir LİSTE aralık sanılırdı.
-    (?:between|from)\s+({_VER_LOOSE})\s*(?:and|through|thru|to|–|—|-)\s*({_VER_LOOSE})
-    |
-    # ①b "versions 1.3.0 - 1.3.6", "7.0.0 through 7.4.2", "12.1.2 through 12.1.4-h*"
-    #     "versions?" öneki bu dala dahil — aksi halde sade dal (⑦) önce
-    #     eşleşip aralığın sol ucunu yutuyor, sağ ucu kayboluyordu.
-    (?:versions?\s+)?({_VER_LOOSE})\s*(?:through|thru|to|–|—|-)\s*({_VER_LOOSE})
-    |
-    # ② "X and earlier / and below / and prior / or older" → üst sınır
-    #    Dell, cvefeed ve CISA advisory'lerinde EN SIK görülen kalıp.
-    (?:versions?\s+)?({_VER_LOOSE})\s*(?:and|or)\s+(?:earlier|below|prior|older|lower)
-    |
-    # ③ "X and later / or above / and newer" → yamalı sürüm eşiği
-    (?:versions?\s+)?({_VER_LOOSE})\s*(?:and|or)\s+(?:later|above|newer|higher)
-    |
-    # ④ "fixed in 7.4.7", "upgrade to 1.38.3", "resolved in 12.1.4-h5"
-    (?:fixed\s+in|resolved\s+in|patched\s+in|addressed\s+in|remediated\s+in
-      |upgrad(?:e|ing)\s+to|updat(?:e|ing)\s+to)
-    \s+(?:version\s+)?({_VER_LOOSE})
-    |
-    # ⑤ "before 9.0.98", "prior to version 10.2.1", "earlier than 7.6.3",
-    #    "up to 3.1.0", "< 3.1.0", "<= 12.1.4-h5"  → üst sınır
-    (?:before|prior\s+to|earlier\s+than|older\s+than|up\s+to(?:\s+and\s+including)?|<=?)
-    \s*(?:versions?\s+)?({_VER_LOOSE})
-    |
-    # ⑥ ">= 12.1.4-h5", "> 7.4.6" — yamalı/güvenli sürüm eşiği
-    >=?\s*(?:versions?\s+)?({_VER_LOOSE})
-    |
-    # ⑦ "version 7.4.2", "ver 3.1.0", "v2.0.1"
-    #    (?<!cvss\s): "CVSS Version 3.1" tablo başlığını sürüm sanmasın.
-    (?<!cvss\s)(?:versions?\s*:?\s*|ver\.?\s*|[Vv])({_VER_STRICT})
-    |
-    # ⑧ Ürün adından/etiketten sonra bağımsız sürüm: "FortiOS 7.4.2",
-    #    "PAN-OS 11.2.x", "Affected: 11.1.4-h33" (iki nokta da tetikler)
-    (?<=[A-Za-z:]\s)({_VER_STRICT})
-    |
-    # ⑨ Microsoft KB numarası — Microsoft ürünlerinde yamanın kimliği
-    #    sürüm numarası değil KB numarasıdır.
-    (KB\d{{6,8}})
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Yanlış pozitif versiyonları filtrele (tarihler, CVE numaraları, özel IP'ler)
-_FALSE_VERSION_RE = re.compile(
-    r"""^(?:
-        20[0-4]\d\.\d          # tarih benzeri: 2026.8
-      | 19\d\d\.               # 1999.x
-      | CVE- | CWE- | CVSS
-      | 0\.0\.0$               # anlamsız
-      | 10\.0\.0\.\d           # özel IP bloğu 10.0.0.x
-      | 192\.168\.             # özel IP bloğu
-      | 172\.(?:1[6-9]|2\d|3[01])\.   # özel IP bloğu
-      | 127\.0\.0\.1$
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
-
-MAX_VERSIONS = 40  # Tek makaleden çıkarılacak azami sürüm (prompt şişmesin)
 
 
-def extract_versions(text: str) -> list[str]:
-    """Metinden versiyon numaralarını/aralıklarını çıkar.
-
-    Gemini'ye "Detected Versions" alanı olarak ayrı bir liste verilir,
-    böylece model versiyonları kaçırmaz. Tam article body (MAX_BODY_CHARS)
-    üzerinden çalışır.
-
-    Çıktı sürümün ANLAMINI da taşır — Gemini "Etkilenen" ile "Yamalı"
-    sürümleri ayırabilsin diye:
-      "7.0.0 – 7.4.2"    aralık
-      "<= 20.1.0"        bu sürüm ve öncesi etkilenir
-      ">= 7.4.7"         bu sürüm ve sonrası güvenli
-      "< 9.0.98"         bu sürümden önceki her şey etkilenir
-      "fixed in 1.38.3"  yamayı içeren sürüm
-    """
-    found: list[str] = []
-    for m in _VERSION_RE.finditer(text):
-        (btw_lo, btw_hi, rng_lo, rng_hi, le, ge,
-         fixed, lt, gt, kw, standalone, kb) = m.groups()
-
-        lo, hi = (btw_lo or rng_lo), (btw_hi or rng_hi)
-        if lo and hi:
-            token = f"{lo} – {hi}"
-        elif le:
-            token = f"<= {le}"
-        elif ge:
-            token = f">= {ge}"
-        elif fixed:
-            token = f"fixed in {fixed}"
-        elif lt:
-            token = f"< {lt}"
-        elif gt:
-            token = f">= {gt}"
-        else:
-            token = kw or standalone or kb or ""
-
-        token = token.strip(" .,;)")
-        if not token or len(token) < 3:
-            continue
-        # Operatör önekini atlayıp asıl sürüm numarasını doğrula
-        bare = token.split()[-1]
-        if _FALSE_VERSION_RE.match(bare) or _FALSE_VERSION_RE.match(token):
-            continue
-        if token not in found:
-            found.append(token)
-        if len(found) >= MAX_VERSIONS:
-            break
-    return found
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  HTML SANITIZATION (Gemini output → email injection protection)
-#  Gemini'nin ürettiği HTML doğrudan e-postaya enjekte edildiğinden, XSS
-#  ve enjeksiyon riskine karşı whitelist tabanlı temizleyici şart.
-#  Sadece izin verilen tag/attribute'lar kalır, gerisi atılır.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-# E-postada görünmesine izin verilen HTML tag'leri
-_ALLOWED_TAGS = frozenset([
-    "div", "p", "h1", "h2", "h3", "h4", "strong", "em", "a", "br",
-    "span", "ul", "ol", "li", "table", "tr", "td", "th", "thead", "tbody",
-])
-
-# İzin verilen attribute'lar (style: inline CSS, href: linkler için)
-_ALLOWED_ATTRS = frozenset(["style", "href", "class"])
-
-# Attribute değerinde tespit edilirse o attribute atılır (XSS vektörleri)
-_DANGEROUS_ATTR_VALUE = re.compile(
-    r"javascript\s*:|data\s*:|vbscript\s*:|expression\s*\(|url\s*\(",
-    re.IGNORECASE,
-)
-
-
-class _HTMLSanitizer(HTMLParser):
-    """Whitelist-based HTML sanitizer to prevent XSS via Gemini output."""
-
-    def __init__(self):
-        super().__init__()
-        self.result: list[str] = []
-        self._strip_depth = 0  # depth inside a stripped tag
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
-        tag_lower = tag.lower()
-        if tag_lower not in _ALLOWED_TAGS:
-            self._strip_depth += 1
-            return
-        safe_attrs: list[str] = []
-        for attr_name, attr_value in attrs:
-            attr_name_lower = attr_name.lower()
-            if attr_name_lower not in _ALLOWED_ATTRS:
-                continue
-            if attr_value and _DANGEROUS_ATTR_VALUE.search(attr_value):
-                continue
-            # Validate href specifically
-            if attr_name_lower == "href" and attr_value:
-                if not attr_value.startswith(("http://", "https://", "mailto:")):
-                    continue
-            escaped_value = html.escape(attr_value or "", quote=True)
-            safe_attrs.append(f'{attr_name_lower}="{escaped_value}"')
-        attrs_str = (" " + " ".join(safe_attrs)) if safe_attrs else ""
-        self.result.append(f"<{tag_lower}{attrs_str}>")
-
-    def handle_endtag(self, tag: str):
-        tag_lower = tag.lower()
-        if tag_lower not in _ALLOWED_TAGS:
-            if self._strip_depth > 0:
-                self._strip_depth -= 1
-            return
-        self.result.append(f"</{tag_lower}>")
-
-    def handle_data(self, data: str):
-        if self._strip_depth > 0:
-            return  # skip content inside dangerous tags (e.g. <script>)
-        self.result.append(html.escape(data))
-
-    def handle_entityref(self, name: str):
-        if self._strip_depth == 0:
-            self.result.append(f"&{name};")
-
-    def handle_charref(self, name: str):
-        if self._strip_depth == 0:
-            self.result.append(f"&#{name};")
-
-
-def sanitize_gemini_html(raw_html: str) -> str:
-    """Strip dangerous tags/attributes from Gemini output before email injection."""
-    if not raw_html:
-        return ""
-    sanitizer = _HTMLSanitizer()
-    try:
-        sanitizer.feed(raw_html)
-    except Exception:
-        # If parsing fails entirely, escape everything as plain text
-        return html.escape(raw_html)
-    return "".join(sanitizer.result)
+# ── HTML güvenliği ──────────────────────────────────────────────────
+# 2026-09-10: Whitelist tabanlı HTML sanitizer (_HTMLSanitizer, _ALLOWED_TAGS,
+# sanitize_gemini_html) TAMAMEN SİLİNDİ ve daha güçlü bir garantiyle
+# değiştirildi. Artık Gemini HTML üretmiyor — yapılandırılmış JSON döndürüyor,
+# HTML'i biz üretiyoruz ve modelden gelen her alan html.escape()'ten geçiyor.
+# Yani model çıktısı hiçbir noktada HTML olarak YORUMLANMIYOR; "hangi tag'e
+# izin verelim" sorusu ortadan kalktı. Sanitizer'ı düzeltmek yerine ona olan
+# ihtiyacı yok etmek, saldırı yüzeyini kapatmanın daha kesin yolu.
 
 
 # HTTP istek başlıkları — User-Agent kimliği ve kabul edilen MIME türleri
@@ -1118,29 +954,21 @@ def _is_specific_name(name: str) -> bool:
 _NEARBY_VERSION_RE = re.compile(rf"\s{{0,20}}{_VER_LOOSE}")
 
 
-def _is_filename_extension_usage(s: str, match_start: int) -> bool:
-    """Eşleşme hemen bir '.' işaretinden sonra mı geliyor?
-
-    "index.php", "usr-check.php", "save-cvs.php" gibi dosya adı/uzantısı
-    kullanımları — normal kelime-sınırı regex'i (`(?<![\\w-])`) bunları
-    ELEMEZ çünkü nokta bir kelime karakteri değildir. Bu, üçüncü parti bir
-    ürünün (örn. bir dosya yöneticisi eklentisi) İÇ dosya yapısıdır, bizim
-    envanterimizdeki dilin/platformun kendisiyle ilgisi yoktur.
-    """
-    return match_start > 0 and s[match_start - 1] == "."
-
-
 def _has_nearby_version(text: str, pattern: re.Pattern) -> bool:
-    """`pattern`'ın metindeki herhangi bir geçişinin (dosya uzantısı
-    kullanımları hariç) hemen ardından bir sürüm numarası var mı?
-    (bkz. _NEARBY_VERSION_RE yorumu)
+    """`pattern`'ın metindeki herhangi bir geçişinin hemen ardından bir
+    sürüm numarası var mı? (bkz. _NEARBY_VERSION_RE yorumu)
+
+    "index.php", "usr-check.php" gibi dosya adı/uzantısı kullanımları bu
+    döngüye hiç GİRMEZ — `pattern`'ın kendisi (bkz. _compile) bir noktadan
+    hemen sonra gelen eşleşmeleri zaten üretmiyor. Ayrı bir "bu bir dosya
+    uzantısı mı?" filtresi tutmak yerine, sınırı KAYNAĞINDA (regex'in
+    kendisinde) doğru tanımlamak, bu fonksiyonun ve _title_match_is_genuine'in
+    o filtreyi ayrı ayrı hatırlaması gerekliliğini tamamen ortadan kaldırır.
     """
-    for m in pattern.finditer(text):
-        if _is_filename_extension_usage(text, m.start()):
-            continue
-        if _NEARBY_VERSION_RE.match(text, m.end()):
-            return True
-    return False
+    return any(
+        _NEARBY_VERSION_RE.match(text, m.end())
+        for m in pattern.finditer(text)
+    )
 
 
 # Zafiyet SINIFI adları: jenerik bir ürün adının hemen ardından bunlardan
@@ -1171,15 +999,12 @@ def _title_match_is_genuine(norm_title: str, pattern: re.Pattern) -> bool:
 
     Aynı başlıkta hem "gerçek" hem "sınıf-adı" kullanımı bir arada olabilir
     (nadir) — o yüzden İLK eşleşmede değil, HERHANGİ bir eşleşmede genuine
-    olan varsa kabul edilir. Dosya uzantısı kullanımları (bkz.
-    _is_filename_extension_usage) hiç sayılmaz.
+    olan varsa kabul edilir.
     """
-    for m in pattern.finditer(norm_title):
-        if _is_filename_extension_usage(norm_title, m.start()):
-            continue
-        if _VULN_CLASS_RE.match(norm_title, m.end()) is None:
-            return True
-    return False
+    return any(
+        _VULN_CLASS_RE.match(norm_title, m.end()) is None
+        for m in pattern.finditer(norm_title)
+    )
 
 
 def _find_product(text: str, norm_title: str,
@@ -1197,10 +1022,10 @@ def _find_product(text: str, norm_title: str,
     2026-08-27: Eskiden "metinde HERHANGİ bir CVE varsa kabul et" ve "başlıkta
     HERHANGİ bir geçiş yeterli" gibi gevşek kurallar vardı; VulDB/cvefeed gibi
     kaynaklar HER başlığa hem CVE numarası hem zafiyet sınıfı adını koyduğu
-    için bu kurallar pratikte hiçbir şeyi elemiyordu. Aynı gün ikinci bir
-    yanlış pozitif deseni daha bulundu: "index.php", "usr-check.php" gibi
-    dosya adı/uzantısı kullanımları (bkz. _is_filename_extension_usage) —
-    bunlar da hiçbir koşulda geçerli kanıt sayılmaz.
+    için bu kurallar pratikte hiçbir şeyi elemiyordu. "index.php" gibi dosya
+    uzantısı kullanımları ayrı bir yanlış pozitif kaynağıydı — bunlar için
+    ayrı bir filtre fonksiyonu tutmak yerine sınır regex'i (bkz. _compile)
+    düzeltildi, bu yüzden burada görünmezler.
     """
     for name, pattern in patterns:
         if not pattern.search(text):
@@ -1210,6 +1035,25 @@ def _find_product(text: str, norm_title: str,
         if _has_nearby_version(text, pattern) or _title_match_is_genuine(norm_title, pattern):
             return name
     return None
+
+
+def _product_pattern(name: str) -> re.Pattern:
+    """Bir ürün/alias adı için kelime-sınırlı eşleşme deseni derle.
+
+    match_articles() içindeki tüm ürün ve alias adları BU fonksiyonla
+    derlenir — sınırın tanımı (özellikle noktanın sol sınırda dışlanması,
+    bkz. aşağıdaki yorum) TEK bir yerde yaşar. Testler de dahil hiçbir
+    çağıran kendi regex'ini elle kopyalamamalı; öyle yapılırsa (2026-08-27'de
+    test_product_match.py'de olduğu gibi) sınır burada düzeltildiğinde
+    kopya sessizce eskimiş kalır.
+
+    Sol sınır noktayı da (".") dışlar: "index.php", "usr-check.php" gibi
+    dosya adı/uzantısı kullanımları üçüncü parti bir ürünün iç dosya
+    yapısıdır, bizim envanterimizdeki dilin/platformun kendisiyle ilgisi
+    yoktur (Veno File Manager/LimeSurvey CVE'leri "php" ile yanlış
+    eşleşiyordu).
+    """
+    return re.compile(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", re.IGNORECASE)
 
 
 def match_articles(articles: list[dict]) -> list[dict]:
@@ -1240,13 +1084,11 @@ def match_articles(articles: list[dict]) -> list[dict]:
             active_aliases.extend(norm(a) for a in entry["aliases"])
     active_aliases.sort(key=len, reverse=True)
 
-    # Ürün adı → derlenmiş kelime-sınırlı desen (her makalede yeniden
-    # compile etmek 160 ürün × 500 makale = 80.000 gereksiz compile demekti)
-    def _compile(name: str):
-        return re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])", re.IGNORECASE)
-
-    product_patterns = [(p, _compile(p)) for p in exact_products]
-    alias_patterns = [(a, _compile(a)) for a in active_aliases]
+    # Ürün adı → derlenmiş kelime-sınırlı desen (bkz. _product_pattern).
+    # Her makalede yeniden compile etmek 160 ürün × 500 makale = 80.000
+    # gereksiz compile demekti; bir kez derlenip döngü boyunca kullanılır.
+    product_patterns = [(p, _product_pattern(p)) for p in exact_products]
+    alias_patterns = [(a, _product_pattern(a)) for a in active_aliases]
 
     seen_token_sets: list[frozenset[str]] = []
     seen_cves: set[str] = set()
@@ -1307,263 +1149,324 @@ def match_articles(articles: list[dict]) -> list[dict]:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PROMPT BUILDING
-#  Gemini'ye gönderilecek prompt'u hazırla. İki kanaldan veri toplanır:
-#    - RSS özeti (hızlı, kısa)
-#    - Makale sayfası tam metni (yavaş, detay için — paralel çekilir)
+#  ANALİZ MOTORU — haber başına Gemini çağrısı (map fazı)
+#  Her makale KENDİ isteğinde, tam metniyle analiz edilir. Neden böyle:
+#  bkz. ANALYSIS_MODELS yanındaki "MİMARİ DEĞİŞİKLİĞİ" notu.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def build_prompt(matched: list[dict]) -> str:
-    """En kritik makaleler için Gemini prompt'unu oluştur (limit: MAX_GEMINI_ARTICLES)."""
-    capped = matched[:MAX_GEMINI_ARTICLES]  # Sabit ile kontrol — tek noktadan yönetilir
+# ── CVE kayıtları: sürüm bilgisinin YETKİLİ kaynağı ──────────────────────────
+# 2026-09-10, ölçümle bulundu: Modele giden makale metninin MEDYANI 1572 karakter,
+# makalelerin yarısı 1500 karakterin altında (VulDB bot isteklerini 403'lüyor,
+# MSRC sayfaları JS ile render ediliyor). Yani sürüm alanlarının boş kalmasının
+# sebebi modelin beceriksizliği DEĞİL — o metinlerde sürüm bilgisi HİÇ YOK.
+# Ne regex ne de dil modeli, var olmayan veriyi çıkaramaz.
+#
+# Ama bu haberlerin başlığı literal olarak "CVE-2026-0307 | ..." biçiminde ve
+# CVE kayıtlarının resmi, yapılandırılmış ve ücretsiz bir kaynağı var. Örnek:
+# 297 karakterlik bir VulDB özetinden hiçbir sürüm çıkmazken, aynı CVE'nin
+# CNA kaydı "6.3.0 → 6.3.3-h15'ten küçük, 6.2.0 → 6.2.8-h14, 6.0.0 → 6.0.15"
+# veriyor — hem etkilenen hem yamalı sürümü.
+#
+# Bu, modele KURAL yazmak değil, daha iyi VERİ vermektir: yorumlamayı yine
+# model yapar, biz sadece doğru kaynağı önüne koyarız.
+CVE_API_URL = "https://cveawg.mitre.org/api/cve/{cve}"
+CVE_API_TIMEOUT = 10
+MAX_CVE_PER_ARTICLE = 3      # Patch Tuesday derlemeleri onlarca CVE içerebiliyor
+_cve_cache: dict[str, str] = {}          # Aynı CVE birden çok haberde geçebilir
+_cve_cache_lock = threading.Lock()
 
-    # ── Dinamik body limiti: makale sayısına göre TPM güvenliği ──────────
-    # Her makalenin overhead'ı ~200 token (Product, Title, Date, Link, RSS, Versions).
-    # Kalan bütçeyi body_chars olarak eşit dağıt. Az makale = daha derin bağlam.
-    _OVERHEAD_PER_ARTICLE = 200  # sabit alanların tahmini token maliyeti
-    _CHARS_PER_TOKEN = 4         # ortalama (İngilizce/Türkçe karışık kaynak)
-    available_tokens = MAX_PROMPT_TOKENS - (_OVERHEAD_PER_ARTICLE * len(capped))
-    body_limit = min(GEMINI_BODY_CHARS, max(500, int(available_tokens * _CHARS_PER_TOKEN / len(capped))))
-    log.info("Dynamic body limit: %d chars/article (articles=%d, budget=%dK tokens)",
-             body_limit, len(capped), MAX_PROMPT_TOKENS // 1000)
 
-    # Makale sayfalarını paralel çek (8 worker — feed'lerden hızlı)
-    log.info("Fetching %d article pages for version details...", len(capped))
-    article_pages: dict[str, tuple[str, str]] = {}
+def _format_cve_versions(data: dict) -> str:
+    """CVE kaydından insan/model okunur sürüm özeti çıkar.
+
+    CNA kayıtları sürümü birkaç farklı biçimde yazıyor (`version` + `lessThan`,
+    `lessThanOrEqual`, ya da sadece `version`). Hepsi tek bir okunabilir
+    satıra indirgenir; modele yorumlaması için ham yapı değil, düz metin verilir.
+    """
+    cna = data.get("containers", {}).get("cna", {})
+    satirlar = []
+    for etkilenen in cna.get("affected", [])[:6]:
+        urun = " ".join(
+            p for p in (etkilenen.get("vendor"), etkilenen.get("product")) if p and p != "n/a"
+        )
+        parcalar = []
+        for v in etkilenen.get("versions", [])[:8]:
+            if v.get("status") != "affected":
+                continue
+            baslangic = v.get("version")
+            if v.get("lessThan"):
+                parcalar.append(f"{baslangic} ile {v['lessThan']} arası ({v['lessThan']} hariç)")
+            elif v.get("lessThanOrEqual"):
+                parcalar.append(f"{baslangic} – {v['lessThanOrEqual']} (dahil)")
+            elif baslangic:
+                parcalar.append(str(baslangic))
+        if urun and parcalar:
+            satirlar.append(f"  {urun}: {', '.join(parcalar)}")
+    return "\n".join(satirlar)
+
+
+def fetch_cve_record(cve_id: str) -> str:
+    """Tek bir CVE'nin resmi kaydından sürüm özetini getir (önbellekli).
+
+    Kayıt bulunamazsa veya istek başarısız olursa boş string döner — analiz
+    her hâlükârde makale metniyle devam eder, bu bir ZENGİNLEŞTİRME'dir.
+    """
+    with _cve_cache_lock:
+        if cve_id in _cve_cache:
+            return _cve_cache[cve_id]
+    sonuc = ""
+    try:
+        resp = requests.get(
+            CVE_API_URL.format(cve=cve_id),
+            timeout=CVE_API_TIMEOUT,
+            headers={"User-Agent": _FEED_UA_PRIMARY, "Accept": "application/json"},
+        )
+        if resp.status_code == 200:
+            sonuc = _format_cve_versions(resp.json())
+    except Exception as exc:
+        log.debug("CVE kaydı alınamadı (%s): %s", cve_id, exc)
+    with _cve_cache_lock:
+        _cve_cache[cve_id] = sonuc
+    return sonuc
+
+
+def fetch_cve_context(articles: list[dict], bodies: dict[str, str]) -> dict[str, str]:
+    """Makalelerde geçen CVE'lerin resmi sürüm kayıtlarını paralel topla.
+
+    Döndürülen sözlük {makale linki: sürüm bağlamı} biçimindedir; boş değer
+    "bu makale için ek veri yok" demektir.
+    """
+    makale_cveleri: dict[str, list[str]] = {}
+    tum_cveler: set[str] = set()
+    for a in articles:
+        metin = f"{a.get('title', '')} {bodies.get(a.get('link', ''), '')[:4000]}"
+        # dict.fromkeys: sırayı koruyarak tekilleştir (ilk geçen CVE en alakalısı)
+        cveler = list(dict.fromkeys(c.upper() for c in _CVE_RE.findall(metin)))[:MAX_CVE_PER_ARTICLE]
+        if cveler:
+            makale_cveleri[a.get("link", "")] = cveler
+            tum_cveler.update(cveler)
+
+    if not tum_cveler:
+        return {}
+
+    log.info("Fetching %d CVE records for authoritative version data...", len(tum_cveler))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        pool.map(fetch_cve_record, tum_cveler)
+
+    baglamlar: dict[str, str] = {}
+    for link, cveler in makale_cveleri.items():
+        bloklar = [f"{c}:\n{fetch_cve_record(c)}" for c in cveler if fetch_cve_record(c)]
+        if bloklar:
+            baglamlar[link] = "\n".join(bloklar)
+    log.info("  %d/%d makale için resmi sürüm verisi bulundu",
+             len(baglamlar), len(articles))
+    return baglamlar
+
+
+def fetch_article_bodies(articles: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
+    """Makale sayfalarını paralel indir; {link: metin} ve {link: og_image} döndür.
+
+    Hem analiz (tam metin) hem görsel (og:image) bu tek geçişi kullanır —
+    aynı sayfayı iki kez indirmeye gerek yok. İndirilemeyen sayfa için metin
+    boş kalır; analiz o zaman RSS özetiyle devam eder (bkz. analyze_articles).
+    """
+    bodies: dict[str, str] = {}
+    og_images: dict[str, str] = {}
+    log.info("Fetching %d article pages...", len(articles))
     with ThreadPoolExecutor(max_workers=8) as pool:
         future_map = {
             pool.submit(fetch_article_page, a.get("link", "")): a.get("link", "")
-            for a in capped
+            for a in articles
         }
         for future in as_completed(future_map):
-            url = future_map[future]
+            link = future_map[future]
             try:
-                article_pages[url] = future.result()
+                bodies[link], og_images[link] = future.result()
             except Exception:
-                article_pages[url] = ("", "")
-
-    # Her makale için prompt parçası oluştur
-    parts = []
-    for i, a in enumerate(capped, 1):
-        link = a.get("link", "")
-        full_body, og_image = article_pages.get(link, ("", ""))
-        a["og_image"] = og_image
-        rss_content = a.get("content", "")
-
-        # Versiyon çıkarma: TAM METİN kullan (MAX_BODY_CHARS) → kalite korunsun
-        # Bazı advisory'lerde versiyon bilgisi metnin ilerleyen kısımlarında
-        combined_text = f"{rss_content} {full_body}"
-        versions = extract_versions(combined_text)
-        version_str = ", ".join(versions) if versions else "None detected in source"
-
-        # Gemini'ye gönderim: body_limit dinamik olarak ayarlanır (TPM aşımını önler)
-        # Versiyonlar zaten "Detected Versions" alanında ayrıca veriliyor
-        body_for_gemini = full_body[:body_limit]
-
-        # Her makaleyi numarayla etiketle ve standart alanlarla biçimle
-        parts.append(
-            f"[{i}]\n"
-            f"Product: {a['matched_product']}\n"
-            f"Title: {a['title']}\n"
-            f"Date: {a.get('pubDate', 'Unknown')}\n"
-            f"Link: {link}\n"
-            f"RSS Summary: {rss_content}\n"
-            f"Article Context: {body_for_gemini}\n"
-            f"Detected Versions: {version_str}"
-        )
-    # Makaleler arası "---" ayracı (Gemini için görsel bölücü)
-    return "\n\n---\n\n".join(parts)
+                bodies[link], og_images[link] = "", ""
+    bos = sum(1 for b in bodies.values() if not b)
+    if bos:
+        log.info("  %d makale sayfası indirilemedi — RSS özetiyle analiz edilecek", bos)
+    return bodies, og_images
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  GEMINI ANALYSIS
-#  Prompt'u Gemini API'ye gönder, HTML brifing yanıtını al.
-#  Katmanlı dayanıklılık: model-içi retry + yedek model zinciri + kalıcı hatada dur.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# ── Hata sınıflandırma ───────────────────────────────────────────────────────
-# Gemini API hataları üç gruba ayrılır; her grup farklı ele alınır:
-#   permanent  → anahtar/istek hatası; ne retry ne model değişimi düzeltir → dur
-#   next_model → bu model kullanılamıyor (kota dolu / model yok) → yedek modele geç
-#   transient  → 503/500/504/ağ; kısa bekle, aynı modelde tekrar dene, sonra yedeğe
 _PERMANENT_KEYWORDS = (
-    "permission_denied", "unauthenticated", "api key not valid",
-    "invalid_argument", "failed_precondition",
+    "api key not valid", "api_key_invalid", "permission denied",
+    "invalid argument", "unauthenticated",
 )
-_NEXT_MODEL_KEYWORDS = ("resource_exhausted", "quota", "rate limit", "not_found")
-
-def _classify_error(exc: Exception) -> str:
-    """API hatasını 'permanent' | 'next_model' | 'transient' olarak sınıflandır."""
-    msg = str(exc).lower()
-    code = getattr(exc, "code", None)  # google-genai HTTP status (int) — varsa
-    if code in (400, 401, 403) or any(k in msg for k in _PERMANENT_KEYWORDS):
-        return "permanent"
-    if code in (404, 429) or any(k in msg for k in _NEXT_MODEL_KEYWORDS):
-        return "next_model"
-    # 503/500/504/ağ + bilinmeyen hatalar → temkinli: geçici say (retry + fallback)
-    return "transient"
+_QUOTA_KEYWORDS = ("resource_exhausted", "quota", "rate limit", "not_found", "429")
 
 
-# Model zinciri: birincil (en kaliteli) + yedekler. Birincil model erişilemez veya
-# kotası dolu olursa sıradaki denenir. Her modelin AYRI günlük kotası ve AYRI
-# kapasitesi var → 3.5-flash 20 RPD'yi doldursa ya da 503 verse bile brifing kurtulur.
-#
-# 2026-08-27: gemini-2.0-flash EMEKLİYE AYRILDI ve zincirin son halkası olduğu
-# için sessiz bir tek-nokta-arıza haline gelmişti — 3.5 ve 2.5 aynı anda 504
-# verdiğinde son yedek de 404 döndü ve brifing tamamen düştü. Zincir mevcut
-# modellerle yenilendi (API'den canlı olarak doğrulandı). Modeller Google
-# tarafından emekliye ayrıldığı için bu liste yılda birkaç kez kontrol edilmeli:
-#   client.models.list() → generateContent destekleyenleri listeler.
-#
-# 2026-08-27 (aynı gün, ikinci geçiş): gemini-3.7-flash zincire eklendi —
-# client.models.list() ile bu tarihte en yeni GA flash model olduğu, ve
-# ai.google.dev/gemini-api/docs/deprecations sayfasında 3.5/3.6/3.7-flash
-# için "No shutdown date announced" olduğu doğrulandı (2.0-flash ailesinin
-# TAMAMI 1 Haziran 2026'da kapatılmış — üstteki arızanın kök nedeni).
-# gemini-flash-latest şu an 3.7-flash'a çözülüyor; yine de son halka olarak
-# kalıyor çünkü Google yeni bir GA model çıkardığında bu isim otomatik
-# günceli takip eder, listedeki sabit isimler etmez.
-_MODEL_CHAIN = (
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
-    "gemini-flash-latest",  # Google'ın güncel flash takma adı — son çare
-)
+def _is_quota_error(exc: Exception) -> bool:
+    """Hata, bu modelin günlük/dakikalık kotasının dolduğunu mu gösteriyor?
 
-# Geçici hatada model-içi bekleme programı (saniye). Kısa tutulur: yoğunluk geçmezse
-# zaten yedek modele düşülür (toplam süre TimeoutStartSec=600 altında kalsın).
-_TRANSIENT_BACKOFF = (10, 30)
-
-# Bir denemeyi başlatmak için gereken asgari kalan süre (saniye). Ölçülen en
-# yavaş başarılı yanıt ~281 sn olduğundan, bundan azı kalmışsa yeni istek
-# atmak yalnızca bütçeyi tüketir.
-_MIN_ATTEMPT_SECONDS = 300
-
-# 2026-08-27: Gerçek üretimde gözlemlenen üçüncü bir hata modu — modelin
-# HIZLI 503 vermesi değil, isteği ~5 dakika boyunca yanıtsız ASILI TUTUP
-# sonra bağlantıyı koparması ("Server disconnected without sending a
-# response"). Bu, sabit sayıda deneme yapan eski mantıkla BİRLEŞTİĞİNDE
-# felakete yol açtı: tek bir modelde art arda 2 asılı deneme (~2×300 sn)
-# toplam bütçenin (900 sn) çoğunu tüketti ve zincir HİÇ sağlıklı olan
-# gemini-3.6-flash'a ulaşamadan "bütçe doldu" hatasıyla durdu — o gün
-# hiç mail gitmedi (2026-08-27, workflow run 33064763459).
-#
-# Çözüm: bir deneme bu eşikten UZUN sürüp başarısız olduysa (yani gerçek
-# bir asılı-kalma yaşandıysa), aynı modeli TEKRAR DENEMEDEN doğrudan bir
-# sonraki modele geç. Aynı modeli tekrar denemek, o model zaten dakikalarca
-# yanıt veremiyorsa yardımcı olmaz — sadece paylaşılan toplam bütçeyi,
-# asıl işe yarayacak olan FARKLI bir modelin payından çalar. Kısa/anlık
-# hatalar (örn. birkaç saniyede dönen 503) bu eşiğin çok altında kalır ve
-# hâlâ normal kısa-bekle-tekrar-dene mantığından geçer.
-_HANG_THRESHOLD_SECONDS = 60
-
-
-def analyze_with_gemini(prompt: str) -> str:
-    """Gemini API'yi çağır, HTML brifing yanıtını döndür.
-
-    Katmanlı dayanıklılık:
-      1) Kalıcı hata (API anahtarı/istek geçersiz) → hemen dur (hiçbir şey düzeltmez)
-      2) Kota dolu / model yok → hemen yedek modele geç (retry anlamsız)
-      3) Uzun süre asılı kalıp koptu (bkz. _HANG_THRESHOLD_SECONDS) → aynı
-         modeli TEKRAR DENEMEDEN yedek modele geç (paylaşılan bütçeyi korur)
-      4) Hızlı geçici hata (anlık 503/500/ağ) → aynı modelde kısa beklemeyle
-         tekrar dene, tükenirse yedek modele geç
+    Kota hatası alan bir worker kendi modelini bırakır — aynı modele tekrar
+    tekrar vurmak kotayı geri getirmez, sadece kalan makaleleri geciktirir.
     """
-    # API key'i ortam değişkeninden oku (.env'den geldi)
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
+    msg = str(exc).lower()
+    code = getattr(exc, "code", None)
+    return code in (429, 404) or any(k in msg for k in _QUOTA_KEYWORDS)
 
-    # http_options.timeout: istek yanıtsız asılı kalırsa (Google tarafında
-    # gerçekten yaşanıyor) bunu bir TimeoutError'a çevirir — böylece aşağıdaki
-    # retry/model-fallback döngüsü devreye girebilir
-    client = genai.Client(
-        api_key=api_key,
-        http_options=genai.types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS),
+
+def _is_permanent_error(exc: Exception) -> bool:
+    """Hata kalıcı mı (geçersiz anahtar/istek)? Bunda hiçbir model işe yaramaz."""
+    msg = str(exc).lower()
+    code = getattr(exc, "code", None)
+    return code in (400, 401, 403) or any(k in msg for k in _PERMANENT_KEYWORDS)
+
+
+def build_article_prompt(article: dict, body: str, cve_baglami: str = "") -> str:
+    """Tek bir makale için kullanıcı mesajını oluştur.
+
+    Model rolünü ve alan kurallarını SYSTEM_PROMPT taşır; burada sadece
+    o makaleye ait ham veriler var. Sürüm bilgisi için TAM metin verilir —
+    çoğu advisory sürümleri metnin ilerleyen kısımlarında yazar.
+
+    `cve_baglami` doluysa (bkz. fetch_cve_context) makale metninin ÜSTÜNE
+    konur: haber metni kısa/eksik olduğunda bile modelin elinde sürümlerin
+    yetkili kaynağı bulunur.
+    """
+    parcalar = [
+        f"Başlık: {article.get('title', '')}",
+        f"Yayın tarihi: {article.get('pubDate', 'Bilinmiyor')}",
+        f"Ortamımızda eşleşen ürün: {article.get('matched_product', '')}",
+        f"Kaynak: {article.get('link', '')}",
+    ]
+    if cve_baglami:
+        parcalar.append(
+            "\nResmi CVE kaydından etkilenen sürümler (YETKİLİ KAYNAK — haber "
+            "metniyle çelişirse buna güven):\n" + cve_baglami
+        )
+    parcalar.append(f"\nMakale metni:\n{body[:GEMINI_BODY_CHARS]}")
+    return "\n".join(parcalar)
+
+
+def analyze_one_article(client, model: str, article: dict, body: str,
+                        cve_baglami: str = "") -> dict:
+    """Tek makaleyi analiz et ve şemaya uygun sözlük döndür.
+
+    Hata durumunda istisna FIRLATIR — çağıran (worker) hatanın türüne göre
+    (kota / kalıcı / geçici) ne yapacağına karar verir.
+    """
+    response = client.models.generate_content(
+        model=model,
+        contents=build_article_prompt(article, body, cve_baglami),
+        config=genai.types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=ANALYSIS_SCHEMA,
+            http_options=genai.types.HttpOptions(timeout=ARTICLE_TIMEOUT_MS),
+        ),
     )
-    last_error = None
-    max_attempts = len(_TRANSIENT_BACKOFF) + 1  # model başına: 1 ilk + retry sayısı
-    # Toplam bütçe: zincir ne kadar uzarsa uzasın job timeout'unu aşmasın
-    deadline = time.monotonic() + GEMINI_TOTAL_BUDGET_SEC
+    return json.loads(response.text)
 
-    # Dış döngü: modeller (birincil → yedekler)
-    for model in _MODEL_CHAIN:
-        # İç döngü: aynı model için geçici hata retry'ları
-        for attempt in range(1, max_attempts + 1):
-            remaining = deadline - time.monotonic()
-            # Bitmesine imkân olmayan bir isteği başlatma — bütçeyi
-            # tüketip job'ı timeout'a sürüklemekten başka işe yaramaz.
-            if remaining < _MIN_ATTEMPT_SECONDS:
-                log.error(
-                    "Gemini toplam süre bütçesi (%d sn) doldu — kalan modeller "
-                    "denenmeyecek", GEMINI_TOTAL_BUDGET_SEC,
-                )
-                raise RuntimeError(
-                    "Gemini API: toplam süre bütçesi doldu"
-                ) from last_error
-            attempt_start = time.monotonic()
+
+def analyze_articles(articles: list[dict], bodies: dict[str, str],
+                     cve_baglamlari: dict[str, str] | None = None) -> dict[int, dict]:
+    """Makaleleri paralel analiz et; {makale indeksi: analiz} döndür.
+
+    Model başına BİR worker çalışır ve her worker kendi modelinin hız sınırına
+    (MODEL_RPM) uyar. Modeller birbirinden bağımsız kotalara sahip olduğu için
+    bu, global bir kilit/kuyruk gerektirmeden doğal bir hız sınırlaması sağlar.
+
+    İki aşamalı havuz: önce ANALYSIS_MODELS (yüksek kalite). Bunların günlük
+    kotası tükenip hâlâ analiz bekleyen makale kalırsa FALLBACK_MODELS devreye
+    girer — "biraz daha sığ analiz", "hiç analiz yok"tan iyidir.
+
+    Başarısız olan makale sonuçlara HİÇ girmez — çağıran onu taşma tablosuna
+    düşürür. Tek bir makalenin analizi patladığında brifingin tamamının
+    düşmesi (eski tek-prompt mimarisinin kırılganlığı) artık imkânsız.
+    """
+    if not articles:
+        return {}
+
+    pending = list(enumerate(articles))
+    pending_lock = threading.Lock()
+    denemeler: dict[int, int] = {}           # makale indeksi → kaç kez denendi
+    results: dict[int, dict] = {}
+    results_lock = threading.Lock()
+    deadline = time.monotonic() + ANALYSIS_TOTAL_BUDGET_SEC
+    permanent_error: list[Exception] = []
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    def worker(model: str) -> None:
+        son_istek = 0.0
+        while True:
+            if permanent_error or time.monotonic() >= deadline:
+                return
+            with pending_lock:
+                if not pending:
+                    return
+                index, article = pending.pop(0)
+                denemeler[index] = denemeler.get(index, 0) + 1
+
+            # Bu modelin kendi hız sınırı — diğer worker'ları etkilemez
+            bekle = _MODEL_MIN_INTERVAL - (time.monotonic() - son_istek)
+            if bekle > 0:
+                time.sleep(bekle)
+            son_istek = time.monotonic()
+
+            link = article.get("link", "")
+            body = bodies.get(link, "") or article.get("content", "")
             try:
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=genai.types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,     # CTI Analist rolü
-                    ),
+                analiz = analyze_one_article(
+                    client, model, article, body, (cve_baglamlari or {}).get(link, "")
                 )
-                # Yedek model kullanıldıysa görünür kıl (kalite/teşhis için)
-                if model != _MODEL_CHAIN[0]:
-                    log.warning("Brifing YEDEK model ile üretildi: %s", model)
-                return response.text
             except Exception as exc:
-                elapsed = time.monotonic() - attempt_start
-                last_error = exc
-                kind = _classify_error(exc)
-
-                # Kalıcı hata → geçersiz anahtar/istek; model veya retry çözmez
-                if kind == "permanent":
+                if _is_permanent_error(exc):
                     log.error("Gemini kalıcı hata (%s): %s", model, exc)
-                    raise RuntimeError(
-                        "Gemini API kalıcı hata (API anahtarı/istek geçersiz)"
-                    ) from exc
+                    permanent_error.append(exc)
+                    return
+                kota_hatasi = _is_quota_error(exc)
+                # Kota hatası bu makalenin suçu değil — deneme hakkını geri ver,
+                # yoksa kotası dolan bir model makaleleri boş yere tüketir.
+                with pending_lock:
+                    if kota_hatasi:
+                        denemeler[index] -= 1
+                    if denemeler[index] < MAX_ATTEMPTS_PER_ARTICLE:
+                        pending.append((index, article))
+                    else:
+                        log.warning("Makale %d deneme sonrası bırakıldı: %s",
+                                    MAX_ATTEMPTS_PER_ARTICLE, article.get("title", "")[:60])
+                if kota_hatasi:
+                    log.warning("Model '%s' günlük kotası doldu, worker duruyor", model)
+                    return
+                log.warning("Makale analizi başarısız (%s, %s): %s",
+                            model, article.get("title", "")[:60], exc)
+                continue
 
-                # Bu model kullanılamıyor (kota dolu / model yok) → yedeğe geç
-                if kind == "next_model":
-                    log.warning(
-                        "Model '%s' kullanılamıyor (kota/model yok), yedeğe geçiliyor: %s",
-                        model, exc,
-                    )
-                    break  # iç döngüden çık → sıradaki model
+            with results_lock:
+                results[index] = analiz
 
-                # Deneme uzun süre ASILI KALDIKTAN SONRA başarısız olduysa
-                # (bkz. _HANG_THRESHOLD_SECONDS yorumu) aynı modeli TEKRAR
-                # DENEME — paylaşılan bütçeyi boşa harcamadan direkt yedeğe geç.
-                if elapsed >= _HANG_THRESHOLD_SECONDS:
-                    log.warning(
-                        "Model '%s' %.0f sn asılı kaldıktan sonra koptu — "
-                        "aynı model tekrar denenmeyecek, yedeğe geçiliyor: %s",
-                        model, elapsed, exc,
-                    )
-                    break  # iç döngüden çık → sıradaki model
+    def havuzu_calistir(modeller: tuple[str, ...]) -> None:
+        threads = [
+            threading.Thread(target=worker, args=(m,), name=f"analiz-{m}", daemon=True)
+            for m in modeller
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
 
-                # Hızlı geçici hata (ör. anlık 503) → kısa bekle ve aynı modelde tekrar dene
-                if attempt < max_attempts:
-                    wait = _TRANSIENT_BACKOFF[attempt - 1]
-                    log.warning(
-                        "Model '%s' geçici hata (deneme %d/%d): %s — %dsn sonra tekrar",
-                        model, attempt, max_attempts, exc, wait,
-                    )
-                    time.sleep(wait)
-                else:
-                    # Bu modelde geçici hata sürüyor → yedeğe geç (iç döngü biter)
-                    log.warning(
-                        "Model '%s' geçici hatada tükendi, yedeğe geçiliyor: %s",
-                        model, exc,
-                    )
+    havuzu_calistir(ANALYSIS_MODELS)
 
-    # Hiçbir model başaramadı
-    log.error("Tüm modeller başarısız oldu: %s", ", ".join(_MODEL_CHAIN))
-    raise RuntimeError("Gemini API: tüm modeller başarısız oldu") from last_error
+    # Birincil havuzun kotası tükendi ama hâlâ analiz bekleyen makale var mı?
+    if pending and not permanent_error and time.monotonic() < deadline:
+        log.warning("Birincil model havuzu tükendi, %d makale için yedek havuza geçiliyor",
+                    len(pending))
+        havuzu_calistir(FALLBACK_MODELS)
+
+    if permanent_error:
+        raise RuntimeError(
+            "Gemini API kalıcı hata (API anahtarı/istek geçersiz)"
+        ) from permanent_error[0]
+
+    if len(results) < len(articles):
+        log.warning("%d/%d makale analiz edilemedi — taşma tablosuna düşecekler",
+                    len(articles) - len(results), len(articles))
+    return results
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1628,6 +1531,76 @@ OVERFLOW_FOOTER = """\
     </tbody>
   </table>
 </div>"""
+
+
+def _vurgula_olay_tarihi(ozet: str, olay_tarihi: str) -> str:
+    """Özet içinde geçen olay tarihini mavi renkle vurgula (kalın DEĞİL).
+
+    Model, tarihi hem `olay_tarihi` alanında hem de özet metninin içinde
+    AYNEN geçirmekle yükümlü (bkz. SYSTEM_PROMPT). Burada birebir metin
+    değişimi yapılır: tarih özet içinde bulunamazsa hiçbir şey vurgulanmaz
+    (bozuk HTML üretmek yerine sessizce vazgeçilir).
+
+    Girdi ZATEN html.escape()'ten geçmiş olmalı — bu fonksiyon üretilen tek
+    HTML olan <span>'i ekler.
+    """
+    if not olay_tarihi:
+        return ozet
+    kacisli_tarih = html.escape(olay_tarihi)
+    if kacisli_tarih not in ozet:
+        return ozet
+    return ozet.replace(
+        kacisli_tarih,
+        f'<span style="color:#0d6efd;">{kacisli_tarih}</span>',
+        1,
+    )
+
+
+def render_briefing_block(article: dict, analiz: dict, img_cid: str | None) -> str:
+    """Bir makalenin analizinden HTML brifing bloğu üret.
+
+    Modelden gelen HER alan html.escape()'ten geçer — model çıktısı hiçbir
+    zaman HTML olarak yorumlanmaz (eski sanitizer'ın yerini alan garanti).
+    Tek istisna, aşağıda kendi ürettiğimiz <span> etiketidir.
+    """
+    severite = analiz.get("severite", "DÜŞÜK")
+    renk = SEVERITE_RENK.get(severite, SEVERITE_RENK["DÜŞÜK"])
+
+    def alan(ad: str, varsayilan: str = "Belirtilmemiş") -> str:
+        return html.escape(str(analiz.get(ad) or varsayilan))
+
+    ozet = _vurgula_olay_tarihi(alan("ozet", "—"), analiz.get("olay_tarihi", ""))
+
+    gorsel = ""
+    if img_cid:
+        gorsel = (
+            f'<img src="cid:{html.escape(img_cid)}" '
+            f'alt="{html.escape(article.get("title", ""))}" '
+            'style="max-width:100%;height:auto;border-radius:4px;margin:8px 0;">'
+        )
+
+    return f"""<div style="margin-bottom:24px;padding:16px;border-left:4px solid {renk};background:#f9f9f9;font-family:Arial,sans-serif;">
+  <h3 style="margin:0 0 8px 0;color:{renk};">[{html.escape(severite)}] {html.escape(article.get('title', 'Başlıksız'))}</h3>
+  {gorsel}
+  <p><strong>📅 Haber Tarihi:</strong> {html.escape(str(article.get('pubDate', 'Bilinmiyor')))}</p>
+  <p><strong>💾 Eşleşen Ürün:</strong> {html.escape(str(article.get('matched_product', '—')))}</p>
+  <p><strong>🔴 Etkilenen Sürümler:</strong> {alan('etkilenen_surumler')}</p>
+  <p><strong>🟢 Yamalı Sürümler:</strong> {alan('yamali_surumler')}</p>
+  <p><strong>🎯 Etkilenen:</strong> {alan('etkilenen_kapsam')}</p>
+  <p><strong>📝 Özet:</strong> {ozet}</p>
+  <p><strong>🛡️ Aksiyon:</strong> {alan('aksiyon', 'Güncellemeleri takip et.')}</p>
+  <p><strong>💡 Öneri:</strong> {alan('oneri', '—')}</p>
+  <p style="margin:16px 0 0;text-align:center;">
+    <a href="{html.escape(article.get('link', '#'))}" style="display:inline-block;padding:10px 22px;background:#1a1a2e;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:bold;font-size:13px;">Habere Git →</a>
+  </p>
+</div>"""
+
+
+# Severite sıralaması — brifingde en kritik haber en üstte olmalı.
+# Eskiden bu sıralamayı modele yaptırıyorduk ("hepsini YÜKSEK'ten DÜŞÜK'e
+# sırala"); haber başına analizde model diğer haberleri görmediği için
+# sıralama artık kodun işi (ve deterministik).
+_SEVERITE_SIRASI = {"YÜKSEK": 0, "ORTA": 1, "DÜŞÜK": 2}
 
 
 def build_overflow_html(overflow_articles: list[dict]) -> str:
@@ -1741,21 +1714,11 @@ def process_image(url: str, article_link: str) -> bytes | None:
         log.warning("Image processing failed (%s): %s", url, exc)
         return None
 
-def inject_images(html_str: str, cid_map: dict[int, str], titles_map: dict[int, str]) -> str:
-    """[[IMG:n]] token'larını gerçek <img> tag'i ile değiştir.
-
-    ÖNEMLİ: Bu fonksiyon sanitize_gemini_html() SONRASINDA çalışır. Böylece
-    eklenen HTML'i tamamen kod üretir ve sanitizer whitelist'ine img/src
-    eklemek gerekmez (prompt injection ile takip pikseli sokulamaz).
-    Görseli olmayan token'lar tamamen silinir.
-    """
-    def repl(m):
-        n = int(m.group(1))
-        if n in cid_map:
-            alt_text = html.escape(titles_map.get(n, ""), quote=True)
-            return f'<img src="cid:{cid_map[n]}" style="width:100%;height:auto;border-radius:4px;margin:8px 0;" alt="{alt_text}">'
-        return ""
-    return re.sub(r'\[\[IMG:(\d+)\]\]', repl, html_str)
+# NOT: inject_images() ve [[IMG:n]] token mekanizması 2026-09-10'da silindi.
+# O mekanizma, HTML'i MODEL ürettiği için gerekliydi: modele "görselin yerine
+# bu token'ı yaz" dedirtip sonra token'ı kodla <img>'e çeviriyorduk. Artık
+# HTML'i baştan sona kod ürettiği için (render_briefing_block) görselin nereye
+# gireceğini zaten biliyoruz — araya token koyup geri ayıklamaya gerek yok.
 
 
 # DRY_RUN=true: RSS/eşleştirme/Gemini/versiyon çıkarma tam olarak çalışır
@@ -1858,92 +1821,95 @@ def main() -> None:
         top_matches = matched[:MAX_GEMINI_ARTICLES]
         overflow_matches = matched[MAX_GEMINI_ARTICLES:]  # Kalanı listede gösterilir
 
-        prompt = build_prompt(top_matches)
-        log.info("Sending %d articles to Gemini for analysis...", len(top_matches))
+        log.info("Analyzing %d articles individually (%d model workers)...",
+                 len(top_matches), len(ANALYSIS_MODELS))
         if overflow_matches:
             log.info("Overflow: %d additional articles will be listed without AI analysis.", len(overflow_matches))
 
-        # Görselleri indir ve optimize et (Gemini'ye giden tüm makalelerde aranır —
-        # gerçek sınır MAX_TOTAL_IMAGE_BYTES, sabit makale sayısı değil)
+        # Makale tam metinlerini paralel çek — hem analiz hem görsel bunu kullanır
+        bodies, og_images = fetch_article_bodies(top_matches)
+
+        # Haber metni sürüm bilgisi için çoğu zaman yetersiz (bkz. fetch_cve_context
+        # yorumu) — CVE'lerin resmi kayıtlarından yetkili sürüm verisini topla
+        cve_baglamlari = fetch_cve_context(top_matches, bodies)
+
+        # Görsel adayları: RSS'ten gelen veya makale sayfasının og:image'i
         image_tasks = []
-        for i, a in enumerate(top_matches, 1):
-            url = a.get("image_candidate") or a.get("og_image")
+        for i, a in enumerate(top_matches):
+            url = a.get("image_candidate") or og_images.get(a.get("link", ""), "")
             if url:
                 image_tasks.append((i, url, a.get("link", ""), a.get("title", "")))
 
-        # Gemini cagrisini arka plan thread'inde baslat -- gorsel indirme onun
-        # ciktisina bagimli degil (hangi gorselin kullanilacagi haric, o da
-        # asagida ayrica filtreleniyor), bu yuzden ikisi eszamanli surebilir
-        results_by_index = {}
-        with ThreadPoolExecutor(max_workers=1) as gemini_pool:
-            gemini_future = gemini_pool.submit(analyze_with_gemini, prompt)
+        # Analiz (fan-out) ile görsel indirmeyi eşzamanlı yürüt — birbirine bağlı değiller
+        images_by_index: dict[int, bytes | None] = {}
+        with ThreadPoolExecutor(max_workers=1) as analiz_pool:
+            analiz_future = analiz_pool.submit(analyze_articles, top_matches, bodies, cve_baglamlari)
 
             if image_tasks:
                 log.info("Processing %d candidate images...", len(image_tasks))
                 with ThreadPoolExecutor(max_workers=10) as pool:
-                    future_to_idx = {
+                    future_to_task = {
                         pool.submit(process_image, task[1], task[2]): task
                         for task in image_tasks
                     }
-                    for future in as_completed(future_to_idx):
-                        task = future_to_idx[future]
-                        idx = task[0]
+                    for future in as_completed(future_to_task):
+                        task = future_to_task[future]
                         try:
-                            results_by_index[idx] = (future.result(), task[3])
+                            images_by_index[task[0]] = future.result()
                         except Exception as e:
                             log.warning("Image worker failed for %s: %s", task[1], e)
-                            results_by_index[idx] = (None, task[3])
+                            images_by_index[task[0]] = None
 
-            # Gemini analizi al ve HTML olarak sanitize et (XSS koruması)
-            raw_briefing = gemini_future.result()
+            analizler = analiz_future.result()
 
-        briefing_html = sanitize_gemini_html(raw_briefing)
+        log.info("Analysis complete: %d/%d articles analyzed", len(analizler), len(top_matches))
 
-        # Gemini'nin GERÇEKTEN token yazdığı indeksler — "aynı konu hakkında ek
-        # haber" bloğuna düşen makaleler [[IMG:n]] yazmaz, bu yüzden onların
-        # görseli indirilmiş olsa bile bütçeye/eke hiç girmemeli.
-        # sanitize_gemini_html() bu metni değiştirmez (HTML özel karakteri yok).
-        used_indices = {int(n) for n in re.findall(r"\[\[IMG:(\d+)\]\]", briefing_html)}
+        # Analiz edilemeyen makaleler kaybolmaz — taşma tablosuna düşerler
+        basarisiz = [a for i, a in enumerate(top_matches) if i not in analizler]
+        if basarisiz:
+            overflow_matches = basarisiz + overflow_matches
 
-        cid_map = {}
-        titles_map = {}
+        # En kritik haber en üstte: severite, eşitlikte öncelik puanı
+        sirali = sorted(
+            analizler.items(),
+            key=lambda kv: (
+                _SEVERITE_SIRASI.get(kv[1].get("severite"), 3),
+                -top_matches[kv[0]].get("priority_score", 0),
+            ),
+        )
+
+        # Görsel bütçesi — SADECE brifingde gerçekten yer alan makaleler için
+        cid_map: dict[int, str] = {}
         total_image_bytes = 0
         final_images = []
-        eligible_count = 0
         budget_exceeded = False
-
-        # Priority sırasıyla, sadece Gemini'nin kullandığı indeksler için bütçeye ekle
-        for task in image_tasks:
-            idx = task[0]
-            if idx not in used_indices:
+        for index, _ in sirali:
+            img_bytes = images_by_index.get(index)
+            if not img_bytes:
                 continue
-            img_bytes, title = results_by_index.get(idx, (None, ""))
-            if img_bytes:
-                eligible_count += 1
-                if total_image_bytes + len(img_bytes) > MAX_TOTAL_IMAGE_BYTES:
-                    log.warning("Total image bytes limit exceeded. Skipping remaining images.")
-                    budget_exceeded = True
-                    break
-                total_image_bytes += len(img_bytes)
-                cid = f"img{idx}"
-                cid_map[idx] = cid
-                titles_map[idx] = title
-                final_images.append((cid, img_bytes))
+            if total_image_bytes + len(img_bytes) > MAX_TOTAL_IMAGE_BYTES:
+                log.warning("Total image bytes limit exceeded. Skipping remaining images.")
+                budget_exceeded = True
+                break
+            total_image_bytes += len(img_bytes)
+            cid = f"img{index}"
+            cid_map[index] = cid
+            final_images.append((cid, img_bytes))
 
-        # Bütçe kullanımını gözlemlenebilir kıl — havuz genişledikten sonra bu
-        # bütçe artık gerçekten dolabiliyor, üretim loglarında görünür olmalı
         log.info(
             "Image budget: %d attached, %.1f KB / %.1f KB used%s",
             len(final_images), total_image_bytes / 1024, MAX_TOTAL_IMAGE_BYTES / 1024,
             " (budget exceeded — remaining skipped)" if budget_exceeded else "",
         )
 
-        # Görselleri enjekte et (token'ları img tag'i ile değiştir veya sil)
-        injected_html = inject_images(briefing_html, cid_map, titles_map)
+        # Brifing HTML'ini KOD üretir (model sadece veri döndürdü)
+        briefing_html = "".join(
+            render_briefing_block(top_matches[index], analiz, cid_map.get(index))
+            for index, analiz in sirali
+        )
 
-        # Taşma bölümünü ekle (MAX_GEMINI_ARTICLES üzerindeki makaleler için)
-        overflow_html = build_overflow_html(overflow_matches)
-        full_content = injected_html + overflow_html
+        # Taşma bölümünü ekle (analiz edilemeyenler + limit üstü makaleler)
+        full_content = briefing_html + build_overflow_html(overflow_matches)
 
         # E-posta gövdesini oluştur ve gönder
         email_body = EMAIL_TEMPLATE.replace("{date}", today).replace("{content}", full_content)
