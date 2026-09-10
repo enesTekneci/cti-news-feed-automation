@@ -87,7 +87,14 @@ log = logging.getLogger("cti")
 # ── Gemini analiz limitleri ───────────────────────────────────────────────────
 # Tüm limitler tek noktadan yönetilir — gerekirse buradan ayarla.
 MAX_GEMINI_ARTICLES = 50       # Derin analiz yapılacak maks makale sayısı
-MAX_BODY_CHARS      = 10_000   # Makale sayfasından çekilecek maks metin
+# Makale sayfasından çekilecek maks metin. 2026-09-10'da 10.000'den 20.000'e
+# çıkarıldı. Ölçüm (33 makale, script/style temizliği SONRASI): sadece 5 makale
+# 10.000'i aşıyor ve bunlar tam da sürüm tablosu taşıyan uzun vendor
+# advisory'leri (PAN-OS 22K, Cisco IOS XR 15K, Chrome V8 16K). Toplam ek yük
+# çalıştırma başına ~10.000 token — model başına 250K TPM limitinin yanında
+# önemsiz. NOT: Temizlik öncesinde bu sayı 11 makale/110K karakter gibi
+# görünüyordu; farkın tamamı CSS/JS çöpüymüş.
+MAX_BODY_CHARS      = 20_000
 # Haber BAŞINA yapılan analizde modele verilen makale bağlamı. Eskiden 50 haber
 # TEK prompt'a sığdığı için 3.000 karakterle sınırlıydı; artık her haber kendi
 # isteğine sahip olduğundan tam metni (MAX_BODY_CHARS) verebiliyoruz — sürüm
@@ -549,23 +556,41 @@ KURALLAR:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Pre-compiled regex'ler (her kullanımda yeniden compile etmemek için)
+# _SCRIPT_STYLE: <script>/<style> etiketlerinin İÇERİĞİYLE BİRLİKTE silinmesi
+# ZORUNLU. 2026-09-10'da ölçüldü: sadece tag işaretlerini silmek (aşağıdaki
+# _HTML_TAG) CSS ve JavaScript gövdesini "metin" olarak bırakıyordu —
+# bir Cisco advisory'sinin modele giden İLK 300 KARAKTERİ ham JavaScript'ti,
+# 10.000. karakter civarı ise saf CSS. Yani makale metni için ayrılan payın
+# büyük kısmı site şablonuna gidiyor, gerçek advisory içeriği hiç
+# görülmüyordu. Sürüm alanlarının uzun makalelerde bile boş kalmasının
+# sebeplerinden biri buydu.
+_SCRIPT_STYLE = re.compile(
+    r"<(script|style|noscript|template)\b[^>]*>.*?</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _HTML_TAG = re.compile(r"<[^>]*>")
 _WHITESPACE = re.compile(r"\s+")
 
 
 def strip_html(raw: str) -> str:
-    """HTML tag'lerini çıkar, entity'leri çöz, boşlukları tek boşluğa indirge.
+    """HTML'den okunabilir metin çıkar: script/style gövdeleri dahil temizler.
 
-    Entity çözümü versiyon çıkarma için KRİTİK: CISA/vendor advisory'leri
-    sürüm eşiklerini "&lt;=20.1.0" veya "&lt;4.3.4.1" olarak yayınlıyor.
-    Entity çözülmezse regex'in gördüğü metin "&lt;=20.1.0" olur, "<=" ile
-    başlayan hiçbir desen eşleşmez ve "etkilenen sürüm" bilgisi kaybolur.
+    Sıra ÖNEMLİ ve üç adımın da gerekçesi var:
 
-    Sıra önemli: ÖNCE tag'ler silinir, SONRA entity çözülür. Ters sırada
-    "&lt;script&gt;" gerçek bir <script> tag'ine dönüşür ve temizlenmeden
-    metne karışırdı.
+    1) _SCRIPT_STYLE — <script>/<style> etiketleri İÇERİKLERİYLE silinir.
+       Sadece tag işaretlerini silmek CSS/JS gövdesini metin olarak bırakır
+       (bkz. _SCRIPT_STYLE yorumu: modele giden payın büyük kısmını yiyordu).
+    2) _HTML_TAG — kalan tag işaretleri silinir.
+    3) html.unescape — entity'ler çözülür. Bu, sürüm bilgisi için KRİTİK:
+       CISA/vendor advisory'leri eşikleri "&lt;=20.1.0" olarak yayınlıyor.
+
+    Entity çözümü EN SONA bırakılır: daha önce yapılsaydı "&lt;script&gt;"
+    gerçek bir <script> etiketine dönüşüp temizlikten kaçardı.
     """
-    return _WHITESPACE.sub(" ", html.unescape(_HTML_TAG.sub(" ", raw or ""))).strip()
+    metin = _SCRIPT_STYLE.sub(" ", raw or "")
+    metin = _HTML_COMMENT.sub(" ", metin)
+    return _WHITESPACE.sub(" ", html.unescape(_HTML_TAG.sub(" ", metin))).strip()
 
 
 def norm(s: str) -> str:
@@ -1316,6 +1341,28 @@ def _is_permanent_error(exc: Exception) -> bool:
     return code in (400, 401, 403) or any(k in msg for k in _PERMANENT_KEYWORDS)
 
 
+def _analiz_metni(article: dict, sayfa_metni: str) -> str:
+    """Analize gidecek metni oluştur: RSS özeti + makale sayfası metni.
+
+    İkisi birbirinin yerine değil, TAMAMLAYICISI olarak kullanılır:
+      - RSS özeti her zaman var ve kaynak tarafından derlenmiş, öz bilgi.
+      - Sayfa metni daha uzun ama bazı kaynaklarda hiç yok.
+    MSRC gibi içeriğini JavaScript ile yükleyen sayfalarda temizlik sonrası
+    geriye yalnızca sayfa başlığı kalıyor (ölçüldü: 58 karakter). Bu "dolu ama
+    değersiz" metin, tek başına kullanılsaydı RSS özetini bastırırdı — bu
+    yüzden ikisi birleştirilir ve model her hâlükârde elindeki en iyi bilgiyi
+    görür.
+    """
+    parcalar = []
+    rss_ozeti = (article.get("content") or "").strip()
+    if rss_ozeti:
+        parcalar.append(f"RSS özeti: {rss_ozeti}")
+    sayfa = (sayfa_metni or "").strip()
+    if sayfa:
+        parcalar.append(f"Makale sayfası: {sayfa}")
+    return "\n\n".join(parcalar)
+
+
 def build_article_prompt(article: dict, body: str, cve_baglami: str = "") -> str:
     """Tek bir makale için kullanıcı mesajını oluştur.
 
@@ -1409,7 +1456,7 @@ def analyze_articles(articles: list[dict], bodies: dict[str, str],
             son_istek = time.monotonic()
 
             link = article.get("link", "")
-            body = bodies.get(link, "") or article.get("content", "")
+            body = _analiz_metni(article, bodies.get(link, ""))
             try:
                 analiz = analyze_one_article(
                     client, model, article, body, (cve_baglamlari or {}).get(link, "")
