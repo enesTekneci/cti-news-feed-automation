@@ -21,7 +21,7 @@ on:
     # telafi etmek icin. Billing KAPALI, 20 RPD/gun limiti hala gecerli;
     # kisin bu slot nadiren onceki gunun (agir manuel test gunlerinde
     # tukenmis) kotasina denk gelebilir. Bu kabul edilebilir cunku:
-    #   1) _MODEL_CHAIN'deki 5 modelin HER BIRININ AYRI kotasi var,
+    #   1) ANALYSIS_MODELS'deki 5 modelin HER BIRININ AYRI kotasi var,
     #   2) asagidaki YEDEK slot (15:00) sifirlamadan HER ZAMAN sonradir,
     #      yani birincisi kota yuzunden hic mail atamasa bile ikincisi
     #      calisir. Detay: [[cti-news-feed-automation]] hafiza notu.
@@ -62,6 +62,15 @@ concurrency:
 # Varsayilan olarak sadece okuma; yazma yetkisi sadece keepalive job'inda acilir
 permissions:
   contents: read
+
+# Dedup adiminin "gercek gonderim miydi" tespiti, "Dry run onizlemesini
+# yukle" adiminin basarili/skipped olmasina bakarak calisir (asagidaki
+# "Bugun zaten basariyla gonderildi mi kontrol et" adimindaki jq sorgusu).
+# Adim adi ile bu sorgu arasinda yapisal bir bag olmadigi icin (biri
+# yeniden adlandirilirsa dedup sessizce bozulur) TEK kaynaktan tanimlanir:
+# hem step name'i hem jq sorgusu bu degiskeni okur.
+env:
+  DRY_RUN_STEP_NAME: "Dry run onizlemesini yukle"
 
 jobs:
   # ── Ana is: brifingi uret ve mail at ────────────────────────────────────
@@ -111,7 +120,7 @@ jobs:
           sayi=0
           for id in $ids; do
             dry=$(gh run view "$id" --repo "$repo" --json jobs \
-              --jq '[.jobs[].steps[]? | select(.name=="Dry run onizlemesini yukle") | .conclusion] | first // "skipped"')
+              --jq '[.jobs[].steps[]? | select(.name=="'"$DRY_RUN_STEP_NAME"'") | .conclusion] | first // "skipped"')
             if [ "$dry" != "success" ]; then
               sayi=$((sayi + 1))
             fi
@@ -177,7 +186,7 @@ jobs:
         run: python cti_automation.py
 
       # Dry run onizlemesini indirilebilir yap (mail atilmadi, HTML burada)
-      - name: Dry run onizlemesini yukle
+      - name: ${{ env.DRY_RUN_STEP_NAME }}
         if: ${{ inputs.dry_run }}
         uses: actions/upload-artifact@v7
         with:
