@@ -13,7 +13,6 @@ analyzes with Gemini AI, and sends email briefings via Exchange SMTP.
 """
 
 # Standart kütüphane modülleri
-import locale
 import os
 import re
 import json                          # Envanter/alias + Gemini JSON çıktısı
@@ -134,9 +133,9 @@ IMAGE_FETCH_TIMEOUT    = 8
 # (CVE + başlık benzerliği) yapılıyor, sıralama da severite'ye göre mekanik.
 #
 # Kota matematiği (ücretsiz katman, her modelin AYRI kotası var):
-#   Model başına 5 RPM / 20 RPD / 250K TPM. 4 model → 80 RPD kapasite, ~20 RPM.
-#   50 makale = 50 istek → kapasitenin ~%62'si, retry/manuel çalıştırma payı kalır.
-#   Ölçülen tek makale analizi: ~4-5 sn → 4 paralel model ile 50 makale ~1 dk.
+#   Model başına 5 RPM / 20 RPD / 250K TPM. 5 model → 100 RPD kapasite, ~25 RPM.
+#   50 makale = 50 istek → kapasitenin ~%50'si, retry/manuel çalıştırma payı kalır.
+#   Ölçülen tek makale analizi: ~4-5 sn → 5 paralel model ile 50 makale ~1 dk.
 # Birincil havuz — analiz kalitesi burada en yüksek. Normal bir günde (50 makale)
 # yalnızca bunlar kullanılır: 5 model × 20 RPD = 100 istek kapasite.
 ANALYSIS_MODELS = (
@@ -400,8 +399,16 @@ _NOISE_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# CVE numarası (dedup ve puanlama için)
-_CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+# Ürün/alias eşleşmesi (_product_pattern) ve CVE numarası tespiti aynı sol
+# sınırı paylaşır: nokta VE kısa çizgi dışlanır — "index.php" gibi bir dosya
+# adının içindeki "php"yi ya da "MSCVE-2024-1234" gibi bir alt-dizeyi
+# "CVE-2024-1234" sanmayı önler. Tek yerde tanımlanır (bkz. _product_pattern
+# docstring'indeki aynı gerekçe — kopyalanan sınırlar sessizce eskir).
+_SOL_SINIR = r"(?<![\w.-])"
+
+# CVE numarası (dedup ve puanlama için). Önceden sol kelime sınırı yoktu —
+# "MSCVE-2024-1234" gibi bir alt-dizeyi de yanlışlıkla eşleştirebilirdi.
+_CVE_RE = re.compile(rf"{_SOL_SINIR}CVE-\d{{4}}-\d{{4,7}}", re.IGNORECASE)
 
 # "CVSS 9.8", "CVSSv3 Score: 9.1", "Severity: 8.8 | HIGH", "base score of 10.0"
 _CVSS_SCORE_RE = re.compile(
@@ -735,6 +742,21 @@ _SSRF_BLOCKED = re.compile(
 )
 
 
+def _ssrf_kontrol(url: str, asama: str) -> bool:
+    """URL SSRF kara listesine takılıyorsa logla ve True döndür (= engelle).
+
+    fetch_article_page VE process_image AYNI deseni (istek öncesi + redirect
+    SONRASI nihai adres) uygular — iç ağa yönlendirme bilinen bir SSRF
+    bypass yöntemi olduğu için ikisi de iki kez kontrol eder. Tek yerde
+    tanımlanır ki biri güncellenince öteki unutulmasın (2026-09-11'e kadar
+    fetch_article_page'in post-redirect kontrolü eksikti).
+    """
+    if _SSRF_BLOCKED.search(url):
+        log.warning("SSRF blocked (%s): %s", asama, url)
+        return True
+    return False
+
+
 _OG_IMAGE_RE = re.compile(
     r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image["\']',
     re.IGNORECASE
@@ -772,7 +794,12 @@ def _fragment_bolumu_cikar(url: str, html_ham: str) -> str:
     return strip_html(html_ham[baslangic.start():bitis])
 
 
-def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
+# Dosyadaki diğer tüm zaman aşımları modül sabiti (FEED_FETCH_TIMEOUT,
+# ARTICLE_TIMEOUT_MS, IMAGE_FETCH_TIMEOUT gibi) — bu da aynı disipline uyar.
+ARTICLE_PAGE_FETCH_TIMEOUT_SEC = 12
+
+
+def fetch_article_page(url: str, timeout: int = ARTICLE_PAGE_FETCH_TIMEOUT_SEC) -> tuple[str, str]:
     """Makale URL'sine gidip ANA makale metnini ve og:image URL'sini döndürür.
 
     Site şablonu (nav/footer/ilgili-haberler) _ana_metin_cikar tarafından
@@ -782,9 +809,7 @@ def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
     """
     if not url or not url.startswith("http"):
         return "", ""
-    # SSRF koruması
-    if _SSRF_BLOCKED.search(url):
-        log.warning("SSRF blocked: %s", url)
+    if _ssrf_kontrol(url, "article pre-request"):
         return "", ""
     try:
         # max_redirects=3: sonsuz redirect loop'unu önler
@@ -795,6 +820,11 @@ def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
             allow_redirects=True,
         )
         resp.raise_for_status()
+
+        # SSRF: redirect sonrası NIHAI adresi tekrar kontrol et
+        # (iç ağa yönlendirme bilinen bypass yöntemidir)
+        if _ssrf_kontrol(resp.url, "article post-redirect"):
+            return "", ""
 
         # og:image çıkar (sayfa başındaki meta tag'lerde aranır, ilk 8KB yeterli)
         og_image = ""
@@ -916,8 +946,14 @@ def get_rss_image(entry) -> str:
         return m.group(1)
     return ""
 
-def fetch_feed(name: str, url: str) -> list[dict]:
-    """Tek bir RSS feed'i çek ve makale listesi olarak döndür."""
+def fetch_feed(name: str, url: str) -> tuple[list[dict], bool]:
+    """Tek bir RSS feed'i çek; (makale listesi, basarili_mi) döndürür.
+
+    basarili=False SADECE bir istisna (ağ/parse hatası) durumunda döner.
+    Feed'in gerçekten 0 entry döndürmesi (o gün yeni advisory yok) hata
+    SAYILMAZ — aksi halde fetch_all_feeds'teki toplam-başarısızlık eşiği
+    sakin/az üretken kaynakları da yanlışlıkla alarm sebebi sayardı.
+    """
     try:
         feed = _download_feed(url)
         articles = []
@@ -942,16 +978,22 @@ def fetch_feed(name: str, url: str) -> list[dict]:
                 "image_candidate": get_rss_image(entry),
                 "source": name,
             })
-        return articles
+        return articles, True
     except Exception as e:
         # Bir feed çökse de diğerleri devam eder
         log.warning("Feed %s failed: %s", name, e)
-        return []
+        return [], False
 
 
-def fetch_all_feeds() -> list[dict]:
-    """Tüm FEEDS listesini 10 paralel worker ile çek, hepsini birleştir."""
+def fetch_all_feeds() -> tuple[list[dict], int]:
+    """Tüm FEEDS listesini 10 paralel worker ile çek, hepsini birleştir.
+
+    (tüm makaleler, başarısız feed sayısı) döner — ikincisi main()'in
+    toplam bir kesinti mi yoksa sakin/normal bir gün mü olduğunu ayırt
+    edebilmesi için (bkz. _feed_failure_alert_gerekli).
+    """
     all_articles = []
+    failed = 0
     with ThreadPoolExecutor(max_workers=10) as pool:
         # Her feed için bir future oluştur
         futures = {pool.submit(fetch_feed, name, url): name for name, url in FEEDS}
@@ -959,12 +1001,29 @@ def fetch_all_feeds() -> list[dict]:
         for future in as_completed(futures):
             name = futures[future]
             try:
-                articles = future.result()
+                articles, basarili = future.result()
                 log.info("  %s: %d articles", name, len(articles))
                 all_articles.extend(articles)
+                if not basarili:
+                    failed += 1
             except Exception as e:
+                # fetch_feed kendi içindeki tüm istisnaları zaten yutuyor —
+                # buraya düşmesi beklenmez, yine de savunma amaçlı sayılır
                 log.warning("  %s: error — %s", name, e)
-    return all_articles
+                failed += 1
+    return all_articles, failed
+
+
+# Feed'lerin bu orandan fazlası hata verirse muhtemel bir DNS/ağ kesintisi
+# ya da genel bir kod regresyonu vardır — sessizce "temiz gün" maili atmak
+# yerine main() burada fail-loud olur (bkz. modül başı _load_json_env
+# docstring'indeki aynı ilke).
+FEED_FAILURE_ALERT_RATIO = 0.5
+
+
+def _feed_failure_alert_gerekli(basarisiz: int, toplam: int) -> bool:
+    """Saf/test edilebilir eşik kontrolü — main() içine gömülü olsaydı test edilemezdi."""
+    return toplam > 0 and (basarisiz / toplam) > FEED_FAILURE_ALERT_RATIO
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1200,9 +1259,19 @@ def _product_pattern(name: str) -> re.Pattern:
     dosya adı/uzantısı kullanımları üçüncü parti bir ürünün iç dosya
     yapısıdır, bizim envanterimizdeki dilin/platformun kendisiyle ilgisi
     yoktur (Veno File Manager/LimeSurvey CVE'leri "php" ile yanlış
-    eşleşiyordu).
+    eşleşiyordu). Sağ sınır da (2026-09-11) noktayı dışlayacak şekilde SOL
+    ile SİMETRİK hale getirildi — önceden sadece sol taraf noktayı
+    dışlıyordu, bu da "php.net", "cisco.com" gibi üçüncü-taraf alan adı
+    kullanımlarının sağ tarafta yanlışlıkla ürünün kendisi sanılmasına yol
+    açıyordu.
+
+    NOT: Kısa çizgi ("-") her iki tarafta da (ilk commit'ten beri) sınır
+    kabul edilir — yani "PHP-based" gibi bitişik-tireli kullanımlar
+    eşleşMEZ. Bu AYRI, önceden var olan bir tasarım kararı; bilinçli
+    olarak DEĞİŞTİRİLMEDİ — 4e0f372 commit'indeki gibi canlı veriyle
+    (kaç haber kazanılır/kaybedilir) ölçülmeden bu davranış değiştirilmemeli.
     """
-    return re.compile(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", re.IGNORECASE)
+    return re.compile(rf"{_SOL_SINIR}{re.escape(name)}(?![\w.-])", re.IGNORECASE)
 
 
 def match_articles(articles: list[dict]) -> list[dict]:
@@ -1295,6 +1364,9 @@ def match_articles(articles: list[dict]) -> list[dict]:
             # modele ulaşmıyordu. Artık orijinal büyük/küçük harfle, RSS_BODY_CHARS
             # tavanına kadar taşınıyor — analiz kalitesi VE (rss_metni yeterince
             # zenginse) sayfa çekmeyi atlama kararı (bkz. main) buna dayanıyor.
+            # KURAL: bu dict'teki İngilizce alan adları yapısal/meta veri
+            # taşır; "rss_metni" bilinçli bir istisna — ham/zengin metin
+            # taşıyan tek alan olduğu için Türkçe bırakıldı.
             "rss_metni": strip_html(raw_content)[:RSS_BODY_CHARS],
             "priority_score": score_article(text, norm_title, matched_product),
             "image_candidate": article.get("image_candidate", ""),
@@ -1570,12 +1642,34 @@ def build_article_prompt(article: dict, body: str, cve_baglami: str = "") -> str
     return "\n".join(parcalar)
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_model_metni(deger: str) -> str:
+    """Model çıktısındaki fazla/kaçak boşlukları teke indir.
+
+    Canlı örnek (2026-09-11): yamali_surumler = "Belirtilmemiş \nT\n\n\n\n
+    \n\n\n\n\n\n\n\n\n\n\n\n— kaynağı kontrol edin" — modelin kendi JSON
+    string değerine sıkıştırdığı fazladan whitespace/karakter. html.escape()
+    (render_briefing_block'taki alan() helper'ı) bunu AYNEN geçirdiği için
+    brifingde görsel bozukluk olarak çıkıyordu.
+    """
+    return _WHITESPACE_RE.sub(" ", deger).strip()
+
+
 def analyze_one_article(client, model: str, article: dict, body: str,
                         cve_baglami: str = "") -> dict:
     """Tek makaleyi analiz et ve şemaya uygun sözlük döndür.
 
     Hata durumunda istisna FIRLATIR — çağıran (worker) hatanın türüne göre
     (kota / kalıcı / geçici) ne yapacağına karar verir.
+
+    Dönen sözlükteki tüm STRING alanlar (ANALYSIS_SCHEMA'daki 8 alanın
+    hepsi STRING) _normalize_model_metni'den geçer. Kaynakta normalize
+    etmek — render_briefing_block'un alan() helper'ında DEĞİL — önemli:
+    olay_tarihi _vurgula_olay_tarihi'ye alan()'dan GEÇMEDEN ham haliyle
+    veriliyor; sadece alan()'ı düzeltmek ozet'i temizleyip olay_tarihi'ni
+    kirli bırakır ve tarih vurgusunu (mavi span) sessizce kırabilirdi.
     """
     response = client.models.generate_content(
         model=model,
@@ -1587,7 +1681,9 @@ def analyze_one_article(client, model: str, article: dict, body: str,
             http_options=genai.types.HttpOptions(timeout=ARTICLE_TIMEOUT_MS),
         ),
     )
-    return json.loads(response.text)
+    analiz = json.loads(response.text)
+    return {k: (_normalize_model_metni(v) if isinstance(v, str) else v)
+            for k, v in analiz.items()}
 
 
 def analyze_articles(articles: list[dict], bodies: dict[str, str],
@@ -1645,7 +1741,10 @@ def analyze_articles(articles: list[dict], bodies: dict[str, str],
             except Exception as exc:
                 if _is_permanent_error(exc):
                     log.error("Gemini kalıcı hata (%s): %s", model, exc)
-                    permanent_error.append(exc)
+                    # pending/denemeler ile aynı disiplin — permanent_error
+                    # önceden lock'suzdu, dosyanın kendi kilit kuralına aykırıydı
+                    with pending_lock:
+                        permanent_error.append(exc)
                     return
                 kota_hatasi = _is_quota_error(exc)
                 # Kota hatası bu makalenin suçu değil — deneme hakkını geri ver,
@@ -1668,7 +1767,13 @@ def analyze_articles(articles: list[dict], bodies: dict[str, str],
             with results_lock:
                 results[index] = analiz
 
-    def havuzu_calistir(modeller: tuple[str, ...]) -> None:
+    def havuzu_calistir(modeller: tuple[str, ...]) -> list[threading.Thread]:
+        """Bir model havuzunu başlat, bütçe dolana/bitene kadar bekle.
+
+        join(timeout=...) süre bütçesi dolduğunda thread hâlâ çalışıyor
+        olsa bile döner (daemon thread arka planda devam eder) — çağıran
+        hâlâ-canlı thread'leri görüp buna göre karar versin diye döndürülür.
+        """
         threads = [
             threading.Thread(target=worker, args=(m,), name=f"analiz-{m}", daemon=True)
             for m in modeller
@@ -1677,11 +1782,23 @@ def analyze_articles(articles: list[dict], bodies: dict[str, str],
             t.start()
         for t in threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
+        hala_calisan = [t for t in threads if t.is_alive()]
+        if hala_calisan:
+            log.warning("%d worker süre bütçesi dolduğunda hâlâ çalışıyordu: %s",
+                        len(hala_calisan), ", ".join(t.name for t in hala_calisan))
+        return hala_calisan
 
-    havuzu_calistir(ANALYSIS_MODELS)
+    canli_kalanlar = havuzu_calistir(ANALYSIS_MODELS)
 
-    # Birincil havuzun kotası tükendi ama hâlâ analiz bekleyen makale var mı?
-    if pending and not permanent_error and time.monotonic() < deadline:
+    # Yedek havuz SADECE birincil havuzun TÜM thread'leri gerçekten
+    # bittiyse başlar — aksi halde sürüklenen bir ANALYSIS_MODELS thread'i
+    # ile yeni başlayan FALLBACK_MODELS thread'leri aynı anda pending/
+    # results/permanent_error'a erişir (lock'lar veri bozulmasını önler
+    # ama gereksiz çakışmayı ve "geç yazma" riskini büyütür).
+    if canli_kalanlar:
+        log.warning("Birincil havuzdan %d thread hâlâ canlı, yedek havuz BAŞLATILMIYOR",
+                    len(canli_kalanlar))
+    elif pending and not permanent_error and time.monotonic() < deadline:
         log.warning("Birincil model havuzu tükendi, %d makale için yedek havuza geçiliyor",
                     len(pending))
         havuzu_calistir(FALLBACK_MODELS)
@@ -1694,7 +1811,14 @@ def analyze_articles(articles: list[dict], bodies: dict[str, str],
     if len(results) < len(articles):
         log.warning("%d/%d makale analiz edilemedi — taşma tablosuna düşecekler",
                     len(articles) - len(results), len(articles))
-    return results
+
+    # Çıplak `results` referansı yerine kilit altında bir KOPYA döndürülür:
+    # bütçe dolduktan sonra hâlâ canlı kalan bir straggler thread (yukarıdaki
+    # canli_kalanlar) geç bir results[index]=... yazabilir; main() ise aynı
+    # anda bu sözlüğü sorted(...) ile iterate ediyor — "dictionary changed
+    # size during iteration" riski. Kopya main()'e sızan referansı koparır.
+    with results_lock:
+        return dict(results)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1704,6 +1828,12 @@ def analyze_articles(articles: list[dict], bodies: dict[str, str],
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Ana e-posta şablonu — {date} ve {content} replace edilir
+# NOT (2026-09-11): render_briefing_block f-string kullanıyor, bu şablonlar
+# (EMAIL_TEMPLATE/OVERFLOW_*/NO_THREATS_CONTENT) ise .replace("{x}", ...)
+# kullanıyor — tutarsız ama bilinçli olarak DEĞİŞTİRİLMEDİ. Tam bir
+# template-engine'e (Jinja2 vb.) geçiş yeni bir bağımlılık ekler (projenin
+# "yeni bağımlılık yok" ilkesine aykırı) ve fayda/risk oranı düşük —
+# gelecekte ele alınabilecek bir iyileştirme notu olarak burada bırakıldı.
 EMAIL_TEMPLATE = """\
 <!DOCTYPE html>
 <html>
@@ -1730,7 +1860,7 @@ NO_THREATS_CONTENT = """\
   <p style="font-size:48px;margin:0;">✅</p>
   <h2 style="color:#28a745;">Tehdit Tespit Edilmedi</h2>
   <p style="color:#555;">Bugün envanterinizdeki ürünleri etkileyen aktif bir tehdit veya kritik güvenlik açığı tespit edilmedi.</p>
-  <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki tarama yarın saat 11:15'te gerçekleştirilecektir.</p>
+  <p style="color:#888;font-size:13px;margin-top:16px;">Sonraki taramada güncel durum tekrar bildirilecektir.</p>
 </div>"""
 
 # Taşma tablosu — MAX_GEMINI_ARTICLES üzerindeki eşleşmeler için (Gemini analizi yok, sadece liste)
@@ -1857,24 +1987,47 @@ def build_overflow_html(overflow_articles: list[dict]) -> str:
     )
 
 
+# Aynı görsel URL'i birden fazla makalede image_candidate olarak çıkabilir
+# (ör. aynı vendor'a ait iki haber aynı logo/banner'ı kullanır) — full_url
+# bazında önbellekler, _cve_cache/_cve_cache_lock deseninin birebir kopyası.
+_image_cache: dict[str, bytes | None] = {}
+_image_cache_lock = threading.Lock()
+
+
 def process_image(url: str, article_link: str) -> bytes | None:
-    """Görseli indir, doğrula ve e-posta için optimize et.
+    """Görseli indir/optimize et — full_url bazında önbellekli.
+
+    Check-then-set atomik değil (indirme lock DIŞINDA yapılır) — _cve_cache
+    ile aynı, bilinçli olarak kabul edilmiş bir risk: iki thread'in AYNI
+    URL'i eşzamanlı ilk kez görme ihtimali düşük, sonucu en kötü "aynı
+    görsel 2 kez indirilir" (cache OLMADAN zaten olan durumun ta kendisi).
+    Lock'u indirme boyunca tutmak ThreadPoolExecutor(max_workers=10)'un
+    paralelliğini fiilen iptal eder — bu yüzden tercih edilmedi.
+    """
+    if not url:
+        return None
+    full_url = urllib.parse.urljoin(article_link, url)
+    with _image_cache_lock:
+        if full_url in _image_cache:
+            return _image_cache[full_url]
+    sonuc = _process_image_indir(url, full_url)
+    with _image_cache_lock:
+        _image_cache[full_url] = sonuc
+    return sonuc
+
+
+def _process_image_indir(url: str, full_url: str) -> bytes | None:
+    """process_image'ın önbelleksiz indirme/işleme gövdesi.
 
     Güvenlik zinciri: SSRF (istek öncesi + redirect sonrası) → SVG reddi →
     boyut tavanı → magic byte doğrulaması → Pillow ile yeniden boyutlandırma.
     Herhangi bir adım başarısız olursa None döner; brifing etkilenmez.
     """
-    if not url:
-        return None
     try:
-        # Göreceli URL'yi makale linkine göre mutlak hale getir
-        full_url = urllib.parse.urljoin(article_link, url)
         if not full_url.startswith(("http://", "https://")):
             return None
 
-        # SSRF: istek göndermeden önce kontrol
-        if _SSRF_BLOCKED.search(full_url):
-            log.warning("SSRF blocked image pre-request: %s", full_url)
+        if _ssrf_kontrol(full_url, "image pre-request"):
             return None
 
         session = requests.Session()
@@ -1883,10 +2036,7 @@ def process_image(url: str, article_link: str) -> bytes | None:
         resp = session.get(full_url, headers=_REQUEST_HEADERS, timeout=IMAGE_FETCH_TIMEOUT, stream=True)
         resp.raise_for_status()
 
-        # SSRF: redirect sonrası NIHAI adresi tekrar kontrol et
-        # (iç ağa yönlendirme bilinen bypass yöntemidir)
-        if _SSRF_BLOCKED.search(resp.url):
-            log.warning("SSRF blocked image post-redirect: %s", resp.url)
+        if _ssrf_kontrol(resp.url, "image post-redirect"):
             return None
 
         # SVG reddi — script taşıyabilir
@@ -1958,11 +2108,25 @@ def process_image(url: str, article_link: str) -> bytes | None:
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() == "true"
 
 
+def _write_html_preview(dosya_adi: str, email_body: str, sebep: str) -> None:
+    """E-posta gövdesini logs/ altına yaz — DRY_RUN önizlemesi VE gönderim
+    tüm denemelerde başarısız olduğunda son çare kaydı aynı yolu kullanır."""
+    preview_path = LOG_DIR / dosya_adi
+    preview_path.write_text(email_body, encoding="utf-8")
+    log.info("%s: %s", sebep, preview_path)
+
+
 def _write_dry_run_preview(email_body: str) -> None:
     """DRY_RUN modunda e-posta gövdesini dosyaya yaz, SMTP'ye hiç dokunma."""
-    preview_path = LOG_DIR / "dry_run_preview.html"
-    preview_path.write_text(email_body, encoding="utf-8")
-    log.info("DRY_RUN aktif — mail GÖNDERİLMEDİ. Önizleme: %s", preview_path)
+    _write_html_preview("dry_run_preview.html", email_body,
+                         "DRY_RUN aktif — mail GÖNDERİLMEDİ. Önizleme")
+
+
+# send_email için zaman aşımı/retry sabitleri — geçici bir SMTP sorunu
+# günün baştan sona hesaplanmış brifingini kaybettirmesin diye.
+SMTP_TIMEOUT_SEC = 30
+SMTP_SEND_MAX_ATTEMPTS = 2
+SMTP_RETRY_DELAY_SEC = 5
 
 
 def send_email(subject: str, html_body: str,
@@ -1970,6 +2134,8 @@ def send_email(subject: str, html_body: str,
     """E-postayı SMTP üzerinden gönder. STARTTLS + Gmail App Password kullanır.
 
     EMAIL_TO virgülle ayrılarak birden fazla alıcıya gönderim destekler.
+    Tüm SMTP denemeleri başarısız olursa brifing içeriği logs/'a yazılıp
+    (kaybolmasın diye) yine de RuntimeError fırlatılır — fail-loud korunur.
     """
     # SMTP ayarlarını ortamdan oku (varsayılanlar Gmail için)
     smtp_server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
@@ -1986,11 +2152,14 @@ def send_email(subject: str, html_body: str,
     if not all([username, password, recipients]):
         raise RuntimeError("SMTP credentials or EMAIL_TO not configured")
 
+    # "@" içermeyen bir adres denemeden ÖNCE açık hata versin — aksi halde
+    # smtplib alt katmanda daha belirsiz bir hatayla patlar.
+    gecersiz = [a for a in recipients if "@" not in a]
+    if gecersiz:
+        raise RuntimeError(f"EMAIL_TO içinde geçersiz adres(ler): {gecersiz}")
+
     if images:
         msg = MIMEMultipart("related")
-        msg["Subject"] = subject
-        msg["From"] = email_from
-        msg["To"] = ", ".join(recipients)
         msg_alt = MIMEMultipart("alternative")
         msg_alt.attach(MIMEText(html_body, "html", "utf-8"))
         msg.attach(msg_alt)
@@ -2002,22 +2171,44 @@ def send_email(subject: str, html_body: str,
     else:
         # Görsel yoksa mevcut alternative yapısı korunur
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = email_from
-        msg["To"] = ", ".join(recipients)
         msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # Header'lar her iki dalda da aynı — tek yerden set edilir
+    msg["Subject"] = subject
+    msg["From"] = email_from
+    msg["To"] = ", ".join(recipients)
 
     # Güvenli SSL bağlamı (sertifika doğrulama açık)
     context = ssl.create_default_context()
-    with smtplib.SMTP(smtp_server, smtp_port) as server:
-        server.ehlo()
-        server.starttls(context=context)  # Şifreli kanala geç (587 → TLS)
-        server.ehlo()
-        server.login(username, password)
-        # sendmail() liste bekler — tek string verirsen Gmail reddeder
-        server.sendmail(email_from, recipients, msg.as_string())
+    son_hata: Exception | None = None
+    for deneme in range(1, SMTP_SEND_MAX_ATTEMPTS + 1):
+        try:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=SMTP_TIMEOUT_SEC) as server:
+                server.ehlo()
+                server.starttls(context=context)  # Şifreli kanala geç (587 → TLS)
+                server.ehlo()
+                server.login(username, password)
+                # sendmail() liste bekler — tek string verirsen Gmail reddeder
+                server.sendmail(email_from, recipients, msg.as_string())
+            log.info("Email sent to %s", ", ".join(recipients))
+            return
+        except Exception as exc:
+            son_hata = exc
+            log.warning("SMTP gönderim denemesi %d/%d başarısız: %s",
+                        deneme, SMTP_SEND_MAX_ATTEMPTS, exc)
+            if deneme < SMTP_SEND_MAX_ATTEMPTS:
+                time.sleep(SMTP_RETRY_DELAY_SEC)
 
-    log.info("Email sent to %s", ", ".join(recipients))
+    # Tüm denemeler başarısız — brifing kaybolmasın diye diske yaz, sonra
+    # yine de FIRLAT (fail-loud: Actions "failed" işaretlensin, log artifact
+    # yüklensin, 15:00 yedek slotu tekrar dener).
+    _write_html_preview(
+        "failed_send_preview.html", html_body,
+        "SMTP gönderimi tüm denemelerde başarısız — brifing içeriği diske yazıldı",
+    )
+    raise RuntimeError(
+        f"SMTP gönderimi {SMTP_SEND_MAX_ATTEMPTS} denemede de başarısız"
+    ) from son_hata
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2032,8 +2223,15 @@ def main() -> None:
 
     # 1. Tüm RSS feed'lerini paralel çek (10 worker)
     log.info("Fetching %d RSS feeds...", len(FEEDS))
-    all_articles = fetch_all_feeds()
-    log.info("Total articles fetched: %d", len(all_articles))
+    all_articles, failed_feeds = fetch_all_feeds()
+    log.info("Total articles fetched: %d (%d/%d feed hata verdi)",
+              len(all_articles), failed_feeds, len(FEEDS))
+    if _feed_failure_alert_gerekli(failed_feeds, len(FEEDS)):
+        raise RuntimeError(
+            f"{failed_feeds}/{len(FEEDS)} feed hata verdi — muhtemel DNS/ağ "
+            "kesintisi ya da regresyon. 'Tehdit yok' maili sessizce atmak "
+            "yerine burada durur (bkz. FEED_FAILURE_ALERT_RATIO)."
+        )
 
     # 2. Sadece son 24 saatte yayınlanan makaleleri tut
     recent = filter_recent(all_articles)
