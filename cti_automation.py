@@ -87,20 +87,35 @@ log = logging.getLogger("cti")
 # ── Gemini analiz limitleri ───────────────────────────────────────────────────
 # Tüm limitler tek noktadan yönetilir — gerekirse buradan ayarla.
 MAX_GEMINI_ARTICLES = 50       # Derin analiz yapılacak maks makale sayısı
-# Makale sayfasından çekilecek maks metin. 2026-09-10'da 10.000'den 20.000'e
-# çıkarıldı. Ölçüm (33 makale, script/style temizliği SONRASI): sadece 5 makale
-# 10.000'i aşıyor ve bunlar tam da sürüm tablosu taşıyan uzun vendor
-# advisory'leri (PAN-OS 22K, Cisco IOS XR 15K, Chrome V8 16K). Toplam ek yük
-# çalıştırma başına ~10.000 token — model başına 250K TPM limitinin yanında
-# önemsiz. NOT: Temizlik öncesinde bu sayı 11 makale/110K karakter gibi
-# görünüyordu; farkın tamamı CSS/JS çöpüymüş.
+# Makale sayfasından çekilecek maks metin (site şablonu ayıklandıktan SONRA,
+# bkz. _ana_metin_cikar). Ham sayfa boyutu için bir üst sınır — asıl modele
+# giden tavan GEMINI_BODY_CHARS'tır, bu ikisi artık AYRI (aşağıya bkz.).
 MAX_BODY_CHARS      = 20_000
-# Haber BAŞINA yapılan analizde modele verilen makale bağlamı. Eskiden 50 haber
-# TEK prompt'a sığdığı için 3.000 karakterle sınırlıydı; artık her haber kendi
-# isteğine sahip olduğundan tam metni (MAX_BODY_CHARS) verebiliyoruz — sürüm
-# bilgisi çoğu advisory'de metnin ilerleyen kısımlarında geçtiği için bu
-# doğrudan analiz kalitesini artırır.
-GEMINI_BODY_CHARS   = MAX_BODY_CHARS
+# RSS'ten taşınan temiz gövdenin tavanı (match_articles → "rss_metni").
+# GEMINI_BODY_CHARS ile hizalı: zengin bir RSS makalesi (Cisco Talos ~27K,
+# Cloudflare ~9K karakter tam makale veriyor) modele gitmeden önceden
+# kırpılmasın.
+RSS_BODY_CHARS      = 12_000
+# Bu uzunluktaki temiz rss_metni zaten tam bir makale sayılır — sayfayı
+# ayrıca çekmek gereksiz ağ isteği demektir (main()'de kullanılır). Eşik,
+# gerçek "sadece kısa bir teaser" RSS özetleriyle (çoğu PSIRT/CVE-DB
+# kaynağı 300-1500 karakter civarında) gerçek tam-makale veren kaynakları
+# (Talos/Cloudflare/US-CERT, binlerce karakter) net ayıracak kadar yüksek
+# tutuldu.
+ZENGIN_RSS_ESIGI    = 3_000
+# 2026-09-10, İKİNCİ GEÇİŞ: Modele giden metnin büyük kısmının site şablonu
+# (nav menüsü, "ilgili haberler" listesi, footer) olduğu ölçüldü — bir
+# SecurityWeek makalesinde tam sayfanın ~%40'ı bu çöptü. _ana_metin_cikar
+# bunu artık ayıklıyor (bkz. o fonksiyonun yorumu). Bu sayede GEMINI_BODY_CHARS
+# MAX_BODY_CHARS'tan AYRILDI: eskiden "haber başına birleşik metin" tavanı
+# sayfa tavanıyla aynıydı (20.000), artık şablon çöpü gittiği için modele
+# giden SEÇİLMİŞ metin (bkz. _analiz_metni) çok daha küçük olabiliyor.
+#
+# 12.000 GEÇİCİ bir değer — 10K/20K A/B testi Gemini ücretsiz-katman kotası
+# tükendiği için YARIM kaldı (10 istekten 6'sı 429 aldı). Kota sıfırlanınca
+# 10K/12K/16K arası DRY_RUN karşılaştırmasıyla (sürüm alanı doluluk oranı)
+# kesinleştirilmeli — bkz. plan dosyası "Doğrulama" bölümü.
+GEMINI_BODY_CHARS   = 12_000
 MAX_DOWNLOAD_BYTES     = 2_000_000   # İndirme tavanı (optimizasyon öncesi)
 IMAGE_TARGET_WIDTH     = 1280        # 640px görüntüleme × 2 (retina)
 IMAGE_JPEG_QUALITY     = 85
@@ -574,23 +589,94 @@ _WHITESPACE = re.compile(r"\s+")
 
 
 def strip_html(raw: str) -> str:
-    """HTML'den okunabilir metin çıkar: script/style gövdeleri dahil temizler.
+    """HTML'den okunabilir metin çıkar: script/style/yorum gövdeleri dahil temizler.
 
-    Sıra ÖNEMLİ ve üç adımın da gerekçesi var:
+    Sıra ÖNEMLİ ve dört adımın da gerekçesi var:
 
     1) _SCRIPT_STYLE — <script>/<style> etiketleri İÇERİKLERİYLE silinir.
        Sadece tag işaretlerini silmek CSS/JS gövdesini metin olarak bırakır
        (bkz. _SCRIPT_STYLE yorumu: modele giden payın büyük kısmını yiyordu).
-    2) _HTML_TAG — kalan tag işaretleri silinir.
-    3) html.unescape — entity'ler çözülür. Bu, sürüm bilgisi için KRİTİK:
+    2) _HTML_COMMENT — <!-- --> yorumları silinir (bazı sitelerde eski/taslak
+       içerik yorum satırına gömülü kalıyor, görünmeyen metin olarak sızmasın).
+    3) _HTML_TAG — kalan tag işaretleri silinir.
+    4) html.unescape — entity'ler çözülür. Bu, sürüm bilgisi için KRİTİK:
        CISA/vendor advisory'leri eşikleri "&lt;=20.1.0" olarak yayınlıyor.
 
     Entity çözümü EN SONA bırakılır: daha önce yapılsaydı "&lt;script&gt;"
     gerçek bir <script> etiketine dönüşüp temizlikten kaçardı.
+
+    NOT: Bu fonksiyon sadece tag/entity temizler — site ŞABLONUNU (nav/footer/
+    ilgili-haberler) atmaz. Makale SAYFALARI için bkz. _ana_metin_cikar; bu
+    fonksiyon RSS gövdesi gibi zaten şablonsuz kaynaklarda tek başına kullanılır.
     """
     metin = _SCRIPT_STYLE.sub(" ", raw or "")
     metin = _HTML_COMMENT.sub(" ", metin)
     return _WHITESPACE.sub(" ", html.unescape(_HTML_TAG.sub(" ", metin))).strip()
+
+
+# ── Sayfa şablonunu at, ana makale metnini izole et ─────────────────────────
+# 2026-09-10, ikinci geçiş: strip_html tag/script/style temizliyor ama nav
+# menüsü, footer, "ilgili haberler" listesi gibi site ŞABLONUNU metin olarak
+# BIRAKIYOR. Ölçüldü (gerçek SecurityWeek makalesi): tam sayfa strip_html
+# çıktısı 8.214 karakter; ilk ~400'ü saf nav menüsü ("SECURITYWEEK NETWORK:
+# Cybersecurity News Webcasts Virtual Events Podcast..."), ortası bir "Latest
+# articles" listesi. Sayfada 6 ayrı <article> etiketi vardı (ilgili haberler
+# de <article> ile sarılıymış) — sadece İLKİNİ almak 4.816 karaktere indirdi
+# (~%40 azalma), gerçek makale gövdesiyle başlıyordu.
+#
+# Yeni bağımlılık YOK (kullanıcı kararı) — _SCRIPT_STYLE ile AYNI teknik:
+# önce şablon etiketleri İÇERİKLERİYLE silinir, sonra ana bölge aday
+# desenleriyle izole edilmeye çalışılır. Hiçbir aday _MIN_BOLGE_KARAKTER
+# eşiğini geçmezse (ör. site hiç semantik etiket kullanmıyorsa) şablonu
+# temizlenmiş TAM metne düşülür — bu, düzeltme ÖNCESİ davranışla aynıdır,
+# yani sonuç bugünden asla daha kötü olamaz.
+_CHROME_BLOKLARI = re.compile(
+    r"<(nav|header|footer|aside|form)\b[^>]*>.*?</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# Öncelik sırasıyla ana bölge adayları. Non-greedy (.*?): ilk kapanışta durur;
+# "ilgili haberler" kartları gerçek makaleden SONRA geldiği için bu genelde
+# doğru makaleyi yakalar (iç içe/malformed <article> nadir edge-case'lerde
+# erken kesebilir — _MIN_BOLGE_KARAKTER eşiği bunu filtreler).
+_ANA_BOLGE_MAIN = re.compile(r"<main\b[^>]*>(.*?)</main\s*>", re.IGNORECASE | re.DOTALL)
+_ANA_BOLGE_ARTICLE = re.compile(r"<article\b[^>]*>(.*?)</article\s*>", re.IGNORECASE | re.DOTALL)
+# WordPress/genel CMS kalıbı: class="entry-content"/"article-content"/
+# "post-content"/"articleBody". İç içe <div>'ler regex ile dengelenemediği
+# için açılıştan belge SONUNA kadar alınır; kalan footer/nav zaten
+# _CHROME_BLOKLARI'nda silinmiş, kalan varsa karakter tavanı budar.
+_ANA_BOLGE_SINIF = re.compile(
+    r'<div\b[^>]*\bclass="[^"]*(?:entry|article|post)-content[^"]*"[^>]*>(.*)$',
+    re.IGNORECASE | re.DOTALL,
+)
+# Bir bölgenin "gerçek makale" sayılması için asgari temiz karakter. Altında
+# kalırsa güvenilmez kabul edilip bir sonraki adaya (veya tam metne) geçilir.
+# Ölçülen gerçek örnekler: SecurityWeek izole makale 4.816 krk (kazanır);
+# MSRC'nin JS kabuğu 58 krk (hiçbir aday bunu geçemez, tam metne düşülür).
+_MIN_BOLGE_KARAKTER = 800
+
+
+def _ana_metin_cikar(html_ham: str) -> str:
+    """Makale sayfası HTML'inden site şablonunu ATIP ana metni döndür.
+
+    Dosyanın elle-yazılmış regex HTML işleme çizgisini sürdürür (bkz.
+    strip_html / _SCRIPT_STYLE yorumu) — yeni bağımlılık eklemeden.
+
+    Adımlar: script/style/yorum silinir → nav/header/footer/aside/form
+    gövdeleri silinir (_CHROME_BLOKLARI) → ana bölge izole edilmeye
+    çalışılır (<main> → ilk <article> → *-content class'lı div,
+    _MIN_BOLGE_KARAKTER eşiğini İLK geçen kazanır) → hiçbiri tutmazsa
+    şablonu temizlenmiş TAM metin kullanılır (asla daha kötü olmaz).
+    """
+    onceki = _SCRIPT_STYLE.sub(" ", html_ham or "")
+    onceki = _HTML_COMMENT.sub(" ", onceki)
+    govdesiz = _CHROME_BLOKLARI.sub(" ", onceki)
+    for desen in (_ANA_BOLGE_MAIN, _ANA_BOLGE_ARTICLE, _ANA_BOLGE_SINIF):
+        m = desen.search(govdesiz)
+        if m:
+            aday = _WHITESPACE.sub(" ", html.unescape(_HTML_TAG.sub(" ", m.group(1)))).strip()
+            if len(aday) >= _MIN_BOLGE_KARAKTER:
+                return aday
+    return _WHITESPACE.sub(" ", html.unescape(_HTML_TAG.sub(" ", govdesiz))).strip()
 
 
 def norm(s: str) -> str:
@@ -654,11 +740,45 @@ _OG_IMAGE_RE = re.compile(
     re.IGNORECASE
 )
 
-def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
-    """Makale URL'sine gidip sayfa içeriğini ve og:image URL'sini döndürür.
 
-    Tam sayfa içeriği (MAX_BODY_CHARS) versiyon çıkarma için kullanılır.
-    og:image e-posta içi görsel optimizasyonunda aday olarak kullanılır.
+def _fragment_bolumu_cikar(url: str, html_ham: str) -> str:
+    """URL'de bir #fragment (sayfa-içi bağlantı) varsa, SADECE o bölümü izole et.
+
+    2026-09-11'de ölçülerek bulundu: Google Cloud Security Bulletins feed'i
+    TEK bir arşiv sayfasına (711K karakter, 306 bülten) fragment ile bağlantı
+    veriyor (ör. .../index#gcp-2026-033). URL fragment'ı TARAYICI-İÇİ bir
+    mekanizmadır, sunucuya HİÇ gönderilmez — requests.get() her zaman TÜM
+    arşivi indirir. Bunu ayıklamadan _ana_metin_cikar'a bırakınca arşivin
+    yarısını "ana bölge" sanıp 245.956 karakter döndürdü; tek bültenin
+    gerçek boyutu 898 karakter.
+
+    Google Cloud'da fragment sayfada birebir id="..." olarak geçiyor (her
+    bülten <h2 id="gcp-2026-033">...). Bu genel bir kalıp olduğu için
+    (tek-sayfa dokümantasyon/SSS/değişiklik günlüğü siteleri hep böyle
+    yapar) site'ye özel değil: fragment'i taşıyan etiketten, AYNI etiket
+    türünde bir SONRAKİ id'li etikete kadar olan bölüm alınır. Fragment
+    sayfada id olarak geçmiyorsa (çoğu haber sitesi) boş döner —
+    fetch_article_page o zaman normal _ana_metin_cikar yoluna düşer.
+    """
+    fragment = urllib.parse.urlparse(url).fragment
+    if not fragment:
+        return ""
+    baslangic = re.search(rf'<(\w+)\b[^>]*\bid="{re.escape(fragment)}"', html_ham, re.IGNORECASE)
+    if not baslangic:
+        return ""
+    etiket = baslangic.group(1)
+    sonraki = re.search(rf'<{re.escape(etiket)}\b[^>]*\bid="', html_ham[baslangic.end():], re.IGNORECASE)
+    bitis = baslangic.end() + sonraki.start() if sonraki else len(html_ham)
+    return strip_html(html_ham[baslangic.start():bitis])
+
+
+def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
+    """Makale URL'sine gidip ANA makale metnini ve og:image URL'sini döndürür.
+
+    Site şablonu (nav/footer/ilgili-haberler) _ana_metin_cikar tarafından
+    atılır — dönen metin sadece tag'leri silinmiş ham sayfa DEĞİL, mümkün
+    olduğunca makalenin kendisidir. og:image e-posta içi görsel
+    optimizasyonunda aday olarak kullanılır.
     """
     if not url or not url.startswith("http"):
         return "", ""
@@ -682,8 +802,12 @@ def fetch_article_page(url: str, timeout: int = 12) -> tuple[str, str]:
         if m:
             og_image = m.group(1) or m.group(2) or ""
 
-        raw = strip_html(resp.text)
-        return _WHITESPACE.sub(" ", raw).strip()[:MAX_BODY_CHARS], og_image
+        # Önce fragment'e özel bölüm dene (bkz. _fragment_bolumu_cikar —
+        # tek-sayfa arşiv/SSS siteleri için); tutmazsa (çoğu haber sitesi)
+        # normal ana-bölge izolasyonuna düş. İkisi de zaten strip()'li/
+        # boşluğu tekleştirilmiş döner, ekstra _WHITESPACE.sub gerekmiyor.
+        metin = _fragment_bolumu_cikar(url, resp.text) or _ana_metin_cikar(resp.text)
+        return metin[:MAX_BODY_CHARS], og_image
     except Exception as exc:
         # Bir makale çekilemese bile diğerleri devam etmeli — sessizce logla
         log.warning("Article fetch failed (%s): %s", url, exc)
@@ -1163,7 +1287,15 @@ def match_articles(articles: list[dict]) -> list[dict]:
             "link": article.get("link", ""),
             "pubDate": article.get("pubDate", ""),
             "matched_product": matched_product,
-            "content": clean_content[:500],  # Gemini prompt'una eklenecek RSS özeti
+            # 2026-09-10: eskiden burada "content": clean_content[:500] vardı —
+            # KÜÇÜK HARFE çevrilmiş (norm()) ve 500 karaktere kırpılmıştı, tek
+            # tüketicisi _analiz_metni idi. Bazı kaynaklar (Cisco Talos ~27K,
+            # Cloudflare ~9K, US-CERT ~19K karakter) content_encoded/description
+            # alanında TAM makaleyi veriyor; o zenginlik 500'e kırpılınca hiç
+            # modele ulaşmıyordu. Artık orijinal büyük/küçük harfle, RSS_BODY_CHARS
+            # tavanına kadar taşınıyor — analiz kalitesi VE (rss_metni yeterince
+            # zenginse) sayfa çekmeyi atlama kararı (bkz. main) buna dayanıyor.
+            "rss_metni": strip_html(raw_content)[:RSS_BODY_CHARS],
             "priority_score": score_article(text, norm_title, matched_product),
             "image_candidate": article.get("image_candidate", ""),
         })
@@ -1260,11 +1392,18 @@ def fetch_cve_context(articles: list[dict], bodies: dict[str, str]) -> dict[str,
 
     Döndürülen sözlük {makale linki: sürüm bağlamı} biçimindedir; boş değer
     "bu makale için ek veri yok" demektir.
+
+    Tarama girdisi başlık + RSS gövdesi + sayfa metni — SADECE sayfa değil.
+    2026-09-10: sayfa hiç çekilmemiş olabilir (main()'deki ZENGIN_RSS_ESIGI
+    kısayolu) ya da JS kabuğu olabilir (MSRC); o durumlarda CVE kimliği
+    yalnızca RSS metninde geçiyor olabilir — taranmazsa hiç yakalanmazdı.
     """
     makale_cveleri: dict[str, list[str]] = {}
     tum_cveler: set[str] = set()
     for a in articles:
-        metin = f"{a.get('title', '')} {bodies.get(a.get('link', ''), '')[:4000]}"
+        rss = (a.get("rss_metni") or "")[:4000]
+        sayfa = bodies.get(a.get("link", ""), "")[:4000]
+        metin = f"{a.get('title', '')} {rss} {sayfa}"
         # dict.fromkeys: sırayı koruyarak tekilleştir (ilk geçen CVE en alakalısı)
         cveler = list(dict.fromkeys(c.upper() for c in _CVE_RE.findall(metin)))[:MAX_CVE_PER_ARTICLE]
         if cveler:
@@ -1341,26 +1480,68 @@ def _is_permanent_error(exc: Exception) -> bool:
     return code in (400, 401, 403) or any(k in msg for k in _PERMANENT_KEYWORDS)
 
 
-def _analiz_metni(article: dict, sayfa_metni: str) -> str:
-    """Analize gidecek metni oluştur: RSS özeti + makale sayfası metni.
+# 2026-09-10, ikinci geçiş: _analiz_metni eskiden RSS + sayfayı HER ZAMAN
+# birleştiriyordu. Artık ikisi de TEMİZ (rss_metni artık orijinal harfli/tam,
+# sayfa metni artık şablonsuz — bkz. _ana_metin_cikar), bu yüzden uzunluk
+# "hangisi daha bilgi dolu" için dürüst bir vekil oldu: daha UZUN olan
+# birincil kaynak seçilir, ikincisi sadece belirgin şekilde FARKLI bilgi
+# taşıyorsa (düşük kelime örtüşmesi) etiketli ek blok olarak eklenir.
+# Amaç: aynı içeriği iki kez göndermemek, ama RSS'in sayfada olmayan bir
+# sürüm tablosu taşıdığı nadir durumu da kaybetmemek.
+_JS_KABUK_ESIGI = 500       # Bunun altındaki sayfa metni JS kabuğu/boş sayılır
+_IKINCIL_MIN = 300          # İkincil kaynağı eklemeye değmesi için asgari uzunluk
+_IKINCIL_ORTAKLIK = 0.5     # Kelime örtüşmesi bunun üstündeyse "zaten aynı metin"
+_IKINCIL_TAVAN = 3_000
 
-    İkisi birbirinin yerine değil, TAMAMLAYICISI olarak kullanılır:
-      - RSS özeti her zaman var ve kaynak tarafından derlenmiş, öz bilgi.
-      - Sayfa metni daha uzun ama bazı kaynaklarda hiç yok.
-    MSRC gibi içeriğini JavaScript ile yükleyen sayfalarda temizlik sonrası
-    geriye yalnızca sayfa başlığı kalıyor (ölçüldü: 58 karakter). Bu "dolu ama
-    değersiz" metin, tek başına kullanılsaydı RSS özetini bastırırdı — bu
-    yüzden ikisi birleştirilir ve model her hâlükârde elindeki en iyi bilgiyi
-    görür.
+
+def _kelime_ortaklik(kucuk: str, buyuk: str) -> float:
+    """kucuk'teki 5+ harfli benzersiz kelimelerin kaçta kaçı buyuk'te de var?
+
+    Yeni bağımlılık istemeyen kaba "yakın kopya mı" sezgisi — tam bir metin
+    benzerlik algoritması değil, sadece "ikincil kaynak birincilin tekrarı mı,
+    yoksa gerçekten farklı bilgi mi taşıyor" sorusuna ucuz bir cevap.
+    Kısa kelimeler ("ve", "bir", "for") her metinde geçtiği için ayırt edici
+    değildir, elenirler.
     """
-    parcalar = []
-    rss_ozeti = (article.get("content") or "").strip()
-    if rss_ozeti:
-        parcalar.append(f"RSS özeti: {rss_ozeti}")
+    a = set(re.findall(r"[a-zçğıöşü0-9]{5,}", kucuk.lower()))
+    if not a:
+        return 1.0  # boş metin "zaten örtüşüyor" sayılır — eklemeye değmez
+    b = set(re.findall(r"[a-zçğıöşü0-9]{5,}", buyuk.lower()))
+    return len(a & b) / len(a)
+
+
+def _analiz_metni(article: dict, sayfa_metni: str) -> str:
+    """Analize gidecek metni SEÇ: RSS gövdesi vs sayfa metni, hangisi daha iyiyse o.
+
+    - Sayfa metni _JS_KABUK_ESIGI altındaysa (MSRC gibi JS-render sayfalar
+      temizlik sonrası ~58 karakter bırakıyor; ya da sayfa hiç çekilmediyse —
+      bkz. main()'deki ZENGIN_RSS_ESIGI kısayolu) YOK sayılır, RSS'e düşülür.
+    - İkisi de geçerliyse daha UZUN olan birincil kaynaktır.
+    - İkincil kaynak yalnızca hem asgari uzunluktaysa (_IKINCIL_MIN) hem de
+      birincilden belirgin şekilde FARKLIYSA (_kelime_ortaklik düşük) ve
+      birincilde yer varsa etiketli ek blok olarak eklenir.
+    """
+    rss = (article.get("rss_metni") or "").strip()
     sayfa = (sayfa_metni or "").strip()
-    if sayfa:
-        parcalar.append(f"Makale sayfası: {sayfa}")
-    return "\n\n".join(parcalar)
+
+    if len(sayfa) < _JS_KABUK_ESIGI:
+        return rss or sayfa   # sayfa güvenilmez/boş — elde RSS varsa o, yoksa ne varsa
+    if not rss:
+        return sayfa
+
+    if len(sayfa) >= len(rss):
+        birincil, birincil_etiket = sayfa, "Makale sayfası"
+        ikincil, ikincil_etiket = rss, "RSS gövdesi"
+    else:
+        birincil, birincil_etiket = rss, "RSS gövdesi"
+        ikincil, ikincil_etiket = sayfa, "Makale sayfası"
+
+    yer_var = len(birincil) < GEMINI_BODY_CHARS - 500
+    if (len(ikincil) >= _IKINCIL_MIN and yer_var
+            and _kelime_ortaklik(ikincil, birincil) < _IKINCIL_ORTAKLIK):
+        return (f"{birincil_etiket}:\n{birincil}\n\n"
+                f"[Ek kaynak — {ikincil_etiket}]:\n{ikincil[:_IKINCIL_TAVAN]}")
+    return birincil
 
 
 def build_article_prompt(article: dict, body: str, cve_baglami: str = "") -> str:
@@ -1873,8 +2054,20 @@ def main() -> None:
         if overflow_matches:
             log.info("Overflow: %d additional articles will be listed without AI analysis.", len(overflow_matches))
 
+        # RSS zaten zenginse (bazı kaynaklar tam makaleyi content_encoded'da
+        # veriyor — bkz. rss_metni yorumu) sayfayı hiç çekmiyoruz: hem daha
+        # temiz metin (sayfa şablonu içermiyor) hem ~8 paralel HTTP isteği
+        # tasarrufu. Ödün: bu makaleler için og:image adayı kaybolur ama
+        # image_candidate (RSS kaynaklı) zaten öncelikli görsel kaynağı,
+        # aşağıdaki görsel borusu buna göre tasarlanmıştı.
+        sayfa_gereken = [a for a in top_matches if len(a.get("rss_metni", "")) < ZENGIN_RSS_ESIGI]
+        zengin_rss_sayisi = len(top_matches) - len(sayfa_gereken)
+        if zengin_rss_sayisi:
+            log.info("  %d makale zaten zengin RSS içeriğine sahip, sayfa çekilmeyecek",
+                     zengin_rss_sayisi)
+
         # Makale tam metinlerini paralel çek — hem analiz hem görsel bunu kullanır
-        bodies, og_images = fetch_article_bodies(top_matches)
+        bodies, og_images = fetch_article_bodies(sayfa_gereken)
 
         # Haber metni sürüm bilgisi için çoğu zaman yetersiz (bkz. fetch_cve_context
         # yorumu) — CVE'lerin resmi kayıtlarından yetkili sürüm verisini topla
