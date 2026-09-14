@@ -37,7 +37,7 @@ import feedparser                    # RSS/Atom/JSON Feed parser
 import requests                      # HTTP istekleri (article fetch)
 from google import genai             # Gemini AI SDK
 from dotenv import load_dotenv       # .env dosyasından credentials oku
-from PIL import Image                # Görsel optimizasyonu
+from PIL import Image, ImageDraw, ImageFont  # Görsel optimizasyonu + placeholder üretimi
 
 # Decompression bomb koruması: Pillow MAX_IMAGE_PIXELS açıkça sınırlanır (Spec kuralı)
 Image.MAX_IMAGE_PIXELS = 40_000_000
@@ -1914,6 +1914,110 @@ def _vurgula_olay_tarihi(ozet: str, olay_tarihi: str) -> str:
     )
 
 
+# ── Görselsiz haberler için placeholder ─────────────────────────────────────
+# Nano Banana (Gemini görsel üretimi) araştırıldı — ücretsiz katmanda YOK,
+# sadece billing açık hesapta çalışıyor (2026-09-14). Proje bilinçli olarak
+# billing KAPALI tuttuğu için bu yol kapalı; bunun yerine Pillow'un kendi
+# ImageDraw/ImageFont alt modülleriyle (YENİ pip paketi DEĞİL) programatik,
+# sabit bir görsel havuzu üretilir — sıfır maliyet, sıfır dış bağımlılık.
+PLACEHOLDER_WIDTH = 640
+PLACEHOLDER_HEIGHT = 360
+# Severite başına 2 varyant — hem severite tutarlılığı (renk) hem çeşitlilik
+# (aynı görsel hep tekrar etmesin) sağlar. index % bu değer ile DETERMİNİSTİK
+# seçilir (main() içinde) — rastgele DEĞİL, test edilebilir kalsın.
+PLACEHOLDER_VARIANTS_PER_SEVERITY = 2
+# cid Content-ID header'ına gider — ASCII zorunlu, bu yüzden severite'nin
+# kendisi (Türkçe/aksanlı) değil bu slug kullanılır.
+_PLACEHOLDER_SEVERITE_SLUG = {"YÜKSEK": "high", "ORTA": "medium", "DÜŞÜK": "low"}
+
+_placeholder_cache: dict[tuple[str, int], tuple[str, bytes]] = {}
+
+
+def _render_placeholder_image(severite: str, variant: int) -> bytes:
+    """Severite rengiyle sade, programatik bir görsel üret (JPEG bytes).
+
+    process_image()'ın gerçek indirme/doğrulama zincirinden GEÇMEZ — bu
+    görseller hiç indirilmiyor, kaynağı bu fonksiyonun kendisi. Yine de JPEG
+    olarak üretilir ki aynı format garantisine uysun (SVG kabul edilmiyor,
+    bkz. _process_image_indir — script taşıma riski).
+    """
+    renk = SEVERITE_RENK.get(severite, SEVERITE_RENK["DÜŞÜK"])
+    img = Image.new("RGB", (PLACEHOLDER_WIDTH, PLACEHOLDER_HEIGHT), "#1a1a2e")
+    draw = ImageDraw.Draw(img)
+    cx, cy = PLACEHOLDER_WIDTH // 2, PLACEHOLDER_HEIGHT // 2
+
+    if variant % 2 == 0:
+        # Kalkan motifi (basit çokgen)
+        w, h = 160, 190
+        points = [
+            (cx, cy - h // 2), (cx + w // 2, cy - h // 2 + 30),
+            (cx + w // 2, cy + h // 6), (cx, cy + h // 2),
+            (cx - w // 2, cy + h // 6), (cx - w // 2, cy - h // 2 + 30),
+        ]
+        draw.polygon(points, fill=renk)
+    else:
+        # Konsantrik daire motifi — variant 0'dan görsel olarak ayrışsın
+        for i, r in enumerate((110, 75, 40)):
+            bbox = (cx - r, cy - r, cx + r, cy + r)
+            if i % 2:
+                draw.ellipse(bbox, outline=renk, width=10)
+            else:
+                draw.ellipse(bbox, fill=renk)
+
+    font = ImageFont.load_default(size=32)
+    etiket = "CTI"
+    tb = draw.textbbox((0, 0), etiket, font=font)
+    draw.text((cx - (tb[2] - tb[0]) / 2, PLACEHOLDER_HEIGHT - 48),
+              etiket, fill="#ffffff", font=font)
+
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
+    return out.getvalue()
+
+
+def get_placeholder_image(severite: str, variant: int) -> tuple[str, bytes]:
+    """Severite+variant için (cid, jpeg_bytes) döndür — process ömrü boyunca önbellekli.
+
+    Aynı severite+variant kombinasyonu HER ZAMAN aynı cid'i döndürür — bu,
+    aynı severiteyi paylaşan tüm makalelerin AYNI Content-ID'yi referans
+    etmesini (ve final_images'e sadece 1 kez eklenmesini) main() tarafında
+    mümkün kılar; mail boyutu aynı görseli tekrar tekrar göndererek şişmez.
+    """
+    slug = _PLACEHOLDER_SEVERITE_SLUG.get(severite, _PLACEHOLDER_SEVERITE_SLUG["DÜŞÜK"])
+    variant = variant % PLACEHOLDER_VARIANTS_PER_SEVERITY
+    key = (slug, variant)
+    if key not in _placeholder_cache:
+        cid = f"placeholder_{slug}_{variant}"
+        _placeholder_cache[key] = (cid, _render_placeholder_image(severite, variant))
+    return _placeholder_cache[key]
+
+
+def assign_placeholder_images(
+    sirali: list[tuple[int, dict]],
+    cid_map: dict[int, str],
+) -> tuple[dict[int, str], list[tuple[str, bytes]]]:
+    """cid_map'te karşılığı olmayan (görselsiz kalan) her makaleye placeholder ata.
+
+    ÜÇ senaryonun (aday hiç yok / process_image None döndü / görsel bütçesi
+    aşıldı) TEK birleşim noktası: cid_map.get(index) boş dönen her index.
+    Saf fonksiyon — I/O yok, main()'in orkestrasyon mantığından ayrı test
+    edilebilir.
+
+    Döner: (genişletilmiş cid_map, final_images'e eklenecek YENİ (cid, bytes)
+    çiftleri — aynı placeholder'ı paylaşan makaleler için TEKRARSIZ).
+    """
+    yeni_cid_map = dict(cid_map)
+    kullanilanlar: dict[str, bytes] = {}
+    for index, analiz in sirali:
+        if index in yeni_cid_map:
+            continue
+        severite = analiz.get("severite", "DÜŞÜK")
+        cid, img_bytes = get_placeholder_image(severite, index % PLACEHOLDER_VARIANTS_PER_SEVERITY)
+        kullanilanlar[cid] = img_bytes
+        yeni_cid_map[index] = cid
+    return yeni_cid_map, list(kullanilanlar.items())
+
+
 def render_briefing_block(article: dict, analiz: dict, img_cid: str | None) -> str:
     """Bir makalenin analizinden HTML brifing bloğu üret.
 
@@ -2339,6 +2443,15 @@ def main() -> None:
             len(final_images), total_image_bytes / 1024, MAX_TOTAL_IMAGE_BYTES / 1024,
             " (budget exceeded — remaining skipped)" if budget_exceeded else "",
         )
+
+        # Görselsiz kalan makalelere severite bazlı placeholder ata — üç
+        # senaryo (aday yok / indirme başarısız / bütçe aşıldı) burada birleşir.
+        # BİLİNÇLİ OLARAK bütçe döngüsünden SONRA: önce buraya eklenseydi
+        # placeholder'ın kendi boyutu gerçek makale görsellerinin
+        # MAX_TOTAL_IMAGE_BYTES bütçesini çalardı VE bütçe-aşımı senaryosunu
+        # kaçırırdı.
+        cid_map, placeholder_images = assign_placeholder_images(sirali, cid_map)
+        final_images.extend(placeholder_images)
 
         # Brifing HTML'ini KOD üretir (model sadece veri döndürdü)
         briefing_html = "".join(
