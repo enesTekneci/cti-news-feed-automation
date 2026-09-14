@@ -518,6 +518,11 @@ SEVERITE_RENK = {"YÜKSEK": "#dc3545", "ORTA": "#fd7e14", "DÜŞÜK": "#28a745"}
 ANALYSIS_SCHEMA = {
     "type": "OBJECT",
     "properties": {
+        # Triage alanı — en başta, model önce bunu karara bağlamalı. main()
+        # false dönen makaleleri brifingden çıkarıp taşma tablosuna düşürür
+        # (bkz. filter_irrelevant_analyses) — regex eşleşmesi yanlış pozitif
+        # olabilir, bu alan modelin semantik anlayışıyla o riski kapatır.
+        "urun_ile_ilgili_mi": {"type": "BOOLEAN"},
         "severite": {"type": "STRING", "enum": ["YÜKSEK", "ORTA", "DÜŞÜK"]},
         "etkilenen_surumler": {"type": "STRING"},
         "yamali_surumler": {"type": "STRING"},
@@ -528,7 +533,7 @@ ANALYSIS_SCHEMA = {
         "oneri": {"type": "STRING"},
     },
     "required": [
-        "severite", "etkilenen_surumler", "yamali_surumler",
+        "urun_ile_ilgili_mi", "severite", "etkilenen_surumler", "yamali_surumler",
         "etkilenen_kapsam", "ozet", "aksiyon", "oneri",
     ],
 }
@@ -545,6 +550,8 @@ SYSTEM_PROMPT = """Sen kıdemli bir Siber Tehdit İstihbaratı (CTI) analistisin
 Sana TEK bir güvenlik haberi verilecek: başlığı, yayın tarihi, ortamımızdaki hangi ürünle eşleştiği ve makalenin tam metni. Bu haberi derinlemesine analiz edip verilen JSON şemasına göre yanıt ver.
 
 ALANLAR:
+
+urun_ile_ilgili_mi — Bu haber GERÇEKTEN "eşleşen ürün" ile mi ilgili? Ürün adı metinde geçtiği için otomatik olarak eşleştirildi, ama bu bir YANLIŞ POZİTİF olabilir — örn. ürün adı bambaşka bir bağlamda/kelime oyununda geçiyor, farklı bir şirketin/projenin ürünü kastediliyor, ya da haberin konusu gerçekten eşleşen ürünle ilgisiz. false döndür SADECE bundan GERÇEKTEN eminsen. Şüpheli durumlarda ve haber makul ölçüde ürünü konu alıyorsa true döndür — belirsizlikte varsayılan true'dur, emin olmadığın haberleri eleme.
 
 severite — Tehdidin bizim ortamımız için aciliyeti:
   YÜKSEK = aktif olarak istismar ediliyor / kritik RCE / veri ihlali / yama yok
@@ -1914,6 +1921,29 @@ def _vurgula_olay_tarihi(ozet: str, olay_tarihi: str) -> str:
     )
 
 
+def filter_irrelevant_analyses(
+    analizler: dict[int, dict],
+    top_matches: list[dict],
+    overflow_matches: list[dict],
+) -> tuple[dict[int, dict], list[dict]]:
+    """Model 'urun_ile_ilgili_mi: false' dediği makaleleri analizlerden çıkar.
+
+    ORİJİNAL makale dict'i (top_matches[i] — analiz sonucu DEĞİL,
+    build_overflow_html 'title'/'link'/'matched_product' okuyor) olarak
+    taşma listesine eklenir; hiçbir istihbarat tamamen kaybolmaz.
+
+    Alan eksikse (beklenmez, ANALYSIS_SCHEMA'da required) fail-open: True
+    varsayılır — şüpheli durumda haber ELENMEZ.
+    """
+    ilgisiz = {i for i, a in analizler.items() if not a.get("urun_ile_ilgili_mi", True)}
+    if not ilgisiz:
+        return analizler, overflow_matches
+    log.info("Ürünle ilgisiz bulunan %d makale taşma tablosuna düşürüldü.", len(ilgisiz))
+    yeni_overflow = [top_matches[i] for i in ilgisiz] + overflow_matches
+    yeni_analizler = {i: a for i, a in analizler.items() if i not in ilgisiz}
+    return yeni_analizler, yeni_overflow
+
+
 # ── Görselsiz haberler için placeholder ─────────────────────────────────────
 # Nano Banana (Gemini görsel üretimi) araştırıldı — ücretsiz katmanda YOK,
 # sadece billing açık hesapta çalışıyor (2026-09-14). Proje bilinçli olarak
@@ -2410,6 +2440,11 @@ def main() -> None:
         basarisiz = [a for i, a in enumerate(top_matches) if i not in analizler]
         if basarisiz:
             overflow_matches = basarisiz + overflow_matches
+
+        # Ürünle ilgisiz bulunan makaleler ATILMAZ — taşma tablosuna düşürülür
+        # ("hiçbir istihbarat kaybolmaz" ilkesiyle tutarlı)
+        analizler, overflow_matches = filter_irrelevant_analyses(
+            analizler, top_matches, overflow_matches)
 
         # En kritik haber en üstte: severite, eşitlikte öncelik puanı
         sirali = sorted(
