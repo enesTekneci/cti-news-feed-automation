@@ -37,7 +37,7 @@ import feedparser                    # RSS/Atom/JSON Feed parser
 import requests                      # HTTP istekleri (article fetch)
 from google import genai             # Gemini AI SDK
 from dotenv import load_dotenv       # .env dosyasından credentials oku
-from PIL import Image, ImageDraw, ImageFont  # Görsel optimizasyonu + placeholder üretimi
+from PIL import Image                # Görsel optimizasyonu
 
 # Decompression bomb koruması: Pillow MAX_IMAGE_PIXELS açıkça sınırlanır (Spec kuralı)
 Image.MAX_IMAGE_PIXELS = 40_000_000
@@ -1961,11 +1961,14 @@ def filter_irrelevant_analyses(
 
 
 # ── Görselsiz haberler için placeholder ─────────────────────────────────────
-# Nano Banana (Gemini görsel üretimi) araştırıldı — ücretsiz katmanda YOK,
-# sadece billing açık hesapta çalışıyor (2026-09-14). Proje bilinçli olarak
-# billing KAPALI tuttuğu için bu yol kapalı; bunun yerine Pillow'un kendi
-# ImageDraw/ImageFont alt modülleriyle (YENİ pip paketi DEĞİL) programatik,
-# sabit bir görsel havuzu üretilir — sıfır maliyet, sıfır dış bağımlılık.
+# 2026-09-14: İlk sürüm Pillow'un ImageDraw/ImageFont'uyla programatik
+# çiziyordu (kalkan/daire motifleri) — kullanıcı sonucu beğenmedi. Yerine
+# GERÇEK AI-üretilmiş görseller geçti: Nano Banana ücretsiz katmanda
+# olmadığı için (proje billing'i bilinçli olarak kapalı) API'den ÇAĞRILMIYOR
+# — kullanıcı kendi Nano Banana hesabıyla, burada verilen prompt'larla 6
+# görsel üretti, dosya olarak paylaştı; buraya assets/placeholders/ altına
+# 640x360 JPEG olarak optimize edilip commit edildi. Artık BURADA hiç çizim
+# yok, sadece statik dosya okuma + cache.
 PLACEHOLDER_WIDTH = 640
 PLACEHOLDER_HEIGHT = 360
 # Severite başına 2 varyant — hem severite tutarlılığı (renk) hem çeşitlilik
@@ -1973,68 +1976,47 @@ PLACEHOLDER_HEIGHT = 360
 # seçilir (main() içinde) — rastgele DEĞİL, test edilebilir kalsın.
 PLACEHOLDER_VARIANTS_PER_SEVERITY = 2
 # cid Content-ID header'ına gider — ASCII zorunlu, bu yüzden severite'nin
-# kendisi (Türkçe/aksanlı) değil bu slug kullanılır.
+# kendisi (Türkçe/aksanlı) değil bu slug kullanılır. Aynı slug dosya adının
+# da öneki (ör. "high_1.jpg") — bkz. _load_placeholder_image.
 _PLACEHOLDER_SEVERITE_SLUG = {"YÜKSEK": "high", "ORTA": "medium", "DÜŞÜK": "low"}
+_PLACEHOLDER_DIR = Path(__file__).parent / "assets" / "placeholders"
 
 _placeholder_cache: dict[tuple[str, int], tuple[str, bytes]] = {}
 
 
-def _render_placeholder_image(severite: str, variant: int) -> bytes:
-    """Severite rengiyle sade, programatik bir görsel üret (JPEG bytes).
+def _load_placeholder_image(severite: str, variant: int) -> bytes | None:
+    """assets/placeholders/{slug}_{1|2}.jpg dosyasını oku (JPEG bytes).
 
-    process_image()'ın gerçek indirme/doğrulama zincirinden GEÇMEZ — bu
-    görseller hiç indirilmiyor, kaynağı bu fonksiyonun kendisi. Yine de JPEG
-    olarak üretilir ki aynı format garantisine uysun (SVG kabul edilmiyor,
-    bkz. _process_image_indir — script taşıma riski).
+    Dosya eksikse (beklenmez — assets/ repo ile birlikte deploy edilir) None
+    döner ve sadece logla geçilir: placeholder "nice to have" bir özellik,
+    eksikliği mail gönderimini ASLA engellememeli.
     """
-    renk = SEVERITE_RENK.get(severite, SEVERITE_RENK["DÜŞÜK"])
-    img = Image.new("RGB", (PLACEHOLDER_WIDTH, PLACEHOLDER_HEIGHT), "#1a1a2e")
-    draw = ImageDraw.Draw(img)
-    cx, cy = PLACEHOLDER_WIDTH // 2, PLACEHOLDER_HEIGHT // 2
-
-    if variant % 2 == 0:
-        # Kalkan motifi (basit çokgen)
-        w, h = 160, 190
-        points = [
-            (cx, cy - h // 2), (cx + w // 2, cy - h // 2 + 30),
-            (cx + w // 2, cy + h // 6), (cx, cy + h // 2),
-            (cx - w // 2, cy + h // 6), (cx - w // 2, cy - h // 2 + 30),
-        ]
-        draw.polygon(points, fill=renk)
-    else:
-        # Konsantrik daire motifi — variant 0'dan görsel olarak ayrışsın
-        for i, r in enumerate((110, 75, 40)):
-            bbox = (cx - r, cy - r, cx + r, cy + r)
-            if i % 2:
-                draw.ellipse(bbox, outline=renk, width=10)
-            else:
-                draw.ellipse(bbox, fill=renk)
-
-    font = ImageFont.load_default(size=32)
-    etiket = "CTI"
-    tb = draw.textbbox((0, 0), etiket, font=font)
-    draw.text((cx - (tb[2] - tb[0]) / 2, PLACEHOLDER_HEIGHT - 48),
-              etiket, fill="#ffffff", font=font)
-
-    out = BytesIO()
-    img.save(out, format="JPEG", quality=IMAGE_JPEG_QUALITY, optimize=True)
-    return out.getvalue()
+    slug = _PLACEHOLDER_SEVERITE_SLUG.get(severite, _PLACEHOLDER_SEVERITE_SLUG["DÜŞÜK"])
+    yol = _PLACEHOLDER_DIR / f"{slug}_{variant + 1}.jpg"
+    try:
+        return yol.read_bytes()
+    except OSError as exc:
+        log.warning("Placeholder görseli okunamadı (%s): %s", yol, exc)
+        return None
 
 
-def get_placeholder_image(severite: str, variant: int) -> tuple[str, bytes]:
+def get_placeholder_image(severite: str, variant: int) -> tuple[str, bytes] | None:
     """Severite+variant için (cid, jpeg_bytes) döndür — process ömrü boyunca önbellekli.
 
     Aynı severite+variant kombinasyonu HER ZAMAN aynı cid'i döndürür — bu,
     aynı severiteyi paylaşan tüm makalelerin AYNI Content-ID'yi referans
     etmesini (ve final_images'e sadece 1 kez eklenmesini) main() tarafında
     mümkün kılar; mail boyutu aynı görseli tekrar tekrar göndererek şişmez.
+    Dosya okunamazsa None döner (bkz. _load_placeholder_image).
     """
     slug = _PLACEHOLDER_SEVERITE_SLUG.get(severite, _PLACEHOLDER_SEVERITE_SLUG["DÜŞÜK"])
     variant = variant % PLACEHOLDER_VARIANTS_PER_SEVERITY
     key = (slug, variant)
     if key not in _placeholder_cache:
-        cid = f"placeholder_{slug}_{variant}"
-        _placeholder_cache[key] = (cid, _render_placeholder_image(severite, variant))
+        veri = _load_placeholder_image(severite, variant)
+        if veri is None:
+            return None
+        _placeholder_cache[key] = (f"placeholder_{slug}_{variant}", veri)
     return _placeholder_cache[key]
 
 
@@ -2046,8 +2028,8 @@ def assign_placeholder_images(
 
     ÜÇ senaryonun (aday hiç yok / process_image None döndü / görsel bütçesi
     aşıldı) TEK birleşim noktası: cid_map.get(index) boş dönen her index.
-    Saf fonksiyon — I/O yok, main()'in orkestrasyon mantığından ayrı test
-    edilebilir.
+    Saf fonksiyon — I/O yok (get_placeholder_image kendi içinde cache'li disk
+    okuması yapar), main()'in orkestrasyon mantığından ayrı test edilebilir.
 
     Döner: (genişletilmiş cid_map, final_images'e eklenecek YENİ (cid, bytes)
     çiftleri — aynı placeholder'ı paylaşan makaleler için TEKRARSIZ).
@@ -2058,7 +2040,10 @@ def assign_placeholder_images(
         if index in yeni_cid_map:
             continue
         severite = analiz.get("severite", "DÜŞÜK")
-        cid, img_bytes = get_placeholder_image(severite, index % PLACEHOLDER_VARIANTS_PER_SEVERITY)
+        sonuc = get_placeholder_image(severite, index % PLACEHOLDER_VARIANTS_PER_SEVERITY)
+        if sonuc is None:
+            continue
+        cid, img_bytes = sonuc
         kullanilanlar[cid] = img_bytes
         yeni_cid_map[index] = cid
     return yeni_cid_map, list(kullanilanlar.items())
