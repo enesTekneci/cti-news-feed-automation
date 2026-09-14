@@ -345,6 +345,17 @@ HIGH_SIGNAL = [
     "arbitrary code execution",
     "security advisory", "security bulletin",
     "patch tuesday", "emergency patch",
+    # 2026-09-14: has_high_signal() sadece bir ÖN-eleme — ürün adı eşleşmesi
+    # ayrıca ZORUNLU (bkz. match_articles), bu yüzden liste genişlemesi TEK
+    # BAŞINA yanlış pozitif üretmez. Önceden sadece bileşik ifadeler vardı
+    # ("critical vulnerability", "authentication bypass"), çıplak/tek kelime
+    # hâlleri eksikti — "New vulnerability disclosed in X" gibi meşru ama
+    # sade ifadeli haberler score_article()'a hiç girmeden, taşma tablosuna
+    # bile düşmeden sessizce kayboluyordu. Bilinçli olarak EKLENMEYEN: çıplak
+    # "patch" (oyun/yazılım güncellemesi bağlamlarında çok yaygın gürültü),
+    # çıplak "dos"/"kev" (kısa/belirsiz akronimler — tam ifadeleri aşağıda).
+    "exploit", "vulnerable", "vulnerability",
+    "denial of service", "cwe-", "known exploited vulnerabilities",
     # ── İngilizce dışı kaynaklar için sinyal kelimeleri ──────────────────
     # BSI CERT-Bund (DE, 250 entry/gün), CERT-FR (FR) ve JPCERT gibi
     # kaynaklar İngilizce başlık kullanmıyor; bu kelimeler olmadan bu
@@ -429,6 +440,11 @@ _SIGNAL_SCORES: dict[str, int] = {
     "authentication bypass": 2, "privilege escalation": 2,
     "arbitrary code execution": 2, "emergency patch": 2,
     "proof of concept exploit": 2, "poc exploit": 2,
+    # HIGH_SIGNAL'da vardı ama bu tabloda yoktu — _DEFAULT_SIGNAL_SCORE=1
+    # alıyorlardı. CVE/CVSS'siz meşru bir "nation-state actor targets X"
+    # advisory'si yoğun günlerde (MAX_GEMINI_ARTICLES=50 dolduğunda) düşük
+    # öncelikle overflow'a düşme riski taşıyordu.
+    "apt group": 2, "threat actor": 2, "nation-state": 2,
 }
 _DEFAULT_SIGNAL_SCORE = 1  # HIGH_SIGNAL'da olup tabloda olmayan keyword'ler
 
