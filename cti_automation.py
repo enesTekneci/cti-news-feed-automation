@@ -539,6 +539,12 @@ ANALYSIS_SCHEMA = {
         # (bkz. filter_irrelevant_analyses) — regex eşleşmesi yanlış pozitif
         # olabilir, bu alan modelin semantik anlayışıyla o riski kapatır.
         "urun_ile_ilgili_mi": {"type": "BOOLEAN"},
+        # Brifingde gösterilen başlık. Kaynak başlığı DEĞİL — 2026-09-15'te
+        # ölçüldü: bir günün 19 brifing başlığının 17'si Almanca'ydı (BSI
+        # CERT-Bund) ve "[UPDATE] [hoch]" gibi kaynak-özel önek gürültüsü
+        # taşıyordu. Model zaten makaleyi tam metniyle görüyor; başlığı da
+        # o yazıyor (bkz. render_briefing_block).
+        "baslik": {"type": "STRING"},
         "severite": {"type": "STRING", "enum": ["YÜKSEK", "ORTA", "DÜŞÜK"]},
         "etkilenen_surumler": {"type": "STRING"},
         "yamali_surumler": {"type": "STRING"},
@@ -549,8 +555,8 @@ ANALYSIS_SCHEMA = {
         "oneri": {"type": "STRING"},
     },
     "required": [
-        "urun_ile_ilgili_mi", "severite", "etkilenen_surumler", "yamali_surumler",
-        "etkilenen_kapsam", "ozet", "aksiyon", "oneri",
+        "urun_ile_ilgili_mi", "baslik", "severite", "etkilenen_surumler",
+        "yamali_surumler", "etkilenen_kapsam", "ozet", "aksiyon", "oneri",
     ],
 }
 
@@ -568,6 +574,8 @@ Sana TEK bir güvenlik haberi verilecek: başlığı, yayın tarihi, ortamımız
 ALANLAR:
 
 urun_ile_ilgili_mi — Bu haber GERÇEKTEN "eşleşen ürün" ile mi ilgili? Ürün adı metinde geçtiği için otomatik olarak eşleştirildi, ama bu bir YANLIŞ POZİTİF olabilir — örn. ürün adı bambaşka bir bağlamda/kelime oyununda geçiyor, farklı bir şirketin/projenin ürünü kastediliyor, ya da haberin konusu gerçekten eşleşen ürünle ilgisiz. false döndür SADECE bundan GERÇEKTEN eminsen. Şüpheli durumlarda ve haber makul ölçüde ürünü konu alıyorsa true döndür — belirsizlikte varsayılan true'dur, emin olmadığın haberleri eleme.
+
+baslik — Haberin TÜRKÇE başlığı. Kaynağın kendi başlığını ÇEVİRME, makalenin İÇERİĞİNE bakarak sıfırdan yaz: neyin etkilendiği + ne tür bir açık/olay olduğu net olsun (örn. "NGINX ve NGINX Plus'ta Denial of Service açığı", "Chrome V8'de aktif istismar edilen sıfırıncı gün"). Kurallar: en fazla 12 kelime; ürün adları, sürüm numaraları ve CVE kimlikleri İNGİLİZCE/olduğu gibi kalır; kaynak-özel önekleri ("[UPDATE]", "[NEU]", "[hoch]", "[mittel]", bülten numaraları vb.) ASLA taşıma; tıklama tuzağı/abartı yok, düz ve bilgilendirici ol. Haber bir toplu bülten/haftalık derleme ise bunu başlıkta belirt (örn. "Haftalık güvenlik bülteni derlemesi").
 
 severite — Tehdidin bizim ortamımız için aciliyeti:
   YÜKSEK = aktif olarak istismar ediliyor / kritik RCE / veri ihlali / yama yok
@@ -2064,16 +2072,22 @@ def render_briefing_block(article: dict, analiz: dict, img_cid: str | None) -> s
 
     ozet = _vurgula_olay_tarihi(alan("ozet", "—"), analiz.get("olay_tarihi", ""))
 
+    # Başlığı MODEL yazar (bkz. ANALYSIS_SCHEMA "baslik") — kaynak başlıkları
+    # çoğunlukla yabancı dilde ve kaynak-özel önek gürültüsü taşıyor. Model
+    # alanı boş/eksik bırakırsa orijinal başlığa düşülür: başlıksız blok
+    # üretmektense yabancı dilde başlık göstermek yeğdir.
+    baslik = html.escape(str(analiz.get("baslik") or article.get("title") or "Başlıksız"))
+
     gorsel = ""
     if img_cid:
         gorsel = (
             f'<img src="cid:{html.escape(img_cid)}" '
-            f'alt="{html.escape(article.get("title", ""))}" '
+            f'alt="{baslik}" '
             'style="max-width:100%;height:auto;border-radius:4px;margin:8px 0;">'
         )
 
     return f"""<div style="margin-bottom:24px;padding:16px;border-left:4px solid {renk};background:#f9f9f9;font-family:Arial,sans-serif;">
-  <h3 style="margin:0 0 8px 0;color:{renk};">[{html.escape(severite)}] {html.escape(article.get('title', 'Başlıksız'))}</h3>
+  <h3 style="margin:0 0 8px 0;color:{renk};">[{html.escape(severite)}] {baslik}</h3>
   {gorsel}
   <p><strong>📅 Haber Tarihi:</strong> {html.escape(str(article.get('pubDate', 'Bilinmiyor')))}</p>
   <p><strong>💾 Eşleşen Ürün:</strong> {html.escape(str(article.get('matched_product', '—')))}</p>
