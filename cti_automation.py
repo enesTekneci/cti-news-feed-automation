@@ -1432,6 +1432,12 @@ def match_articles(articles: list[dict]) -> list[dict]:
 CVE_API_URL = "https://cveawg.mitre.org/api/cve/{cve}"
 CVE_API_TIMEOUT = 10
 MAX_CVE_PER_ARTICLE = 3      # Patch Tuesday derlemeleri onlarca CVE içerebiliyor
+# Brifingde "CVE:" satırında gösterilecek azami CVE sayısı. CVE.org'dan veri
+# çekme limitinden (MAX_CVE_PER_ARTICLE) AYRI: çekmek ağ maliyeti, göstermek
+# sadece yer kaplar. 2026-09-22 ölçümü: 35 makalenin 4'ünde 10+ CVE vardı,
+# en uçta 98 (Ubuntu kernel advisory'si) — limitsiz bırakmak brifingi bir
+# CVE duvarına çevirirdi. Limit aşılırsa "ve N tane daha" eki yazılır.
+MAX_CVE_IN_BRIEFING = 8
 _cve_cache: dict[str, str] = {}          # Aynı CVE birden çok haberde geçebilir
 _cve_cache_lock = threading.Lock()
 
@@ -1490,44 +1496,65 @@ def fetch_cve_record(cve_id: str) -> str:
     return sonuc
 
 
-def fetch_cve_context(articles: list[dict], bodies: dict[str, str]) -> dict[str, str]:
+def makale_cveleri(article: dict, sayfa_metni: str = "") -> list[str]:
+    """Makalede geçen CVE kimliklerini sırayı koruyarak, tekilleştirerek çıkar.
+
+    TEK kaynak: hem CVE.org bağlam toplama (fetch_cve_context) hem brifingdeki
+    "CVE:" satırı buradan beslenir — iki yerde ayrı regex/kırpma mantığı
+    olsaydı biri güncellenince öteki sessizce eskirdi.
+
+    Tarama girdisi başlık + RSS gövdesi + sayfa metni — SADECE sayfa DEĞİL:
+    sayfa hiç çekilmemiş (ZENGIN_RSS_ESIGI kısayolu) ya da JS kabuğu (MSRC)
+    olabilir; o durumda CVE yalnızca RSS metninde geçer.
+
+    Kırpma YAPMAZ — çağıran kendi limitini uygular (çekme limiti ile gösterim
+    limiti farklı, bkz. MAX_CVE_PER_ARTICLE / MAX_CVE_IN_BRIEFING).
+    """
+    rss = (article.get("rss_metni") or "")[:4000]
+    metin = f"{article.get('title', '')} {rss} {sayfa_metni[:4000]}"
+    # dict.fromkeys: sırayı koruyarak tekilleştir (ilk geçen CVE en alakalısı)
+    return list(dict.fromkeys(c.upper() for c in _CVE_RE.findall(metin)))
+
+
+def fetch_cve_context(articles: list[dict],
+                      bodies: dict[str, str]) -> tuple[dict[str, str], dict[str, list[str]]]:
     """Makalelerde geçen CVE'lerin resmi sürüm kayıtlarını paralel topla.
 
-    Döndürülen sözlük {makale linki: sürüm bağlamı} biçimindedir; boş değer
-    "bu makale için ek veri yok" demektir.
+    İKİ değer döner:
+      1. {makale linki: sürüm bağlamı} — modele verilecek yetkili CVE verisi;
+         boş değer "bu makale için ek veri yok" demektir.
+      2. {makale linki: [CVE kimlikleri]} — brifingdeki "CVE:" satırı için.
+         Aynı tarama zaten yapılıyordu, sonucu dışarı da veriliyor: ikinci bir
+         regex geçişi yapmanın anlamı yok.
 
-    Tarama girdisi başlık + RSS gövdesi + sayfa metni — SADECE sayfa değil.
-    2026-09-10: sayfa hiç çekilmemiş olabilir (main()'deki ZENGIN_RSS_ESIGI
-    kısayolu) ya da JS kabuğu olabilir (MSRC); o durumlarda CVE kimliği
-    yalnızca RSS metninde geçiyor olabilir — taranmazsa hiç yakalanmazdı.
+    CVE.org'dan veri ÇEKME ilk MAX_CVE_PER_ARTICLE ile sınırlı (ağ maliyeti),
+    ama dönen kimlik listesi kırpılmaz — gösterim limitini render katmanı
+    uygular (bkz. MAX_CVE_IN_BRIEFING).
     """
-    makale_cveleri: dict[str, list[str]] = {}
+    makale_cve_listesi: dict[str, list[str]] = {}
     tum_cveler: set[str] = set()
     for a in articles:
-        rss = (a.get("rss_metni") or "")[:4000]
-        sayfa = bodies.get(a.get("link", ""), "")[:4000]
-        metin = f"{a.get('title', '')} {rss} {sayfa}"
-        # dict.fromkeys: sırayı koruyarak tekilleştir (ilk geçen CVE en alakalısı)
-        cveler = list(dict.fromkeys(c.upper() for c in _CVE_RE.findall(metin)))[:MAX_CVE_PER_ARTICLE]
+        cveler = makale_cveleri(a, bodies.get(a.get("link", ""), ""))
         if cveler:
-            makale_cveleri[a.get("link", "")] = cveler
-            tum_cveler.update(cveler)
+            makale_cve_listesi[a.get("link", "")] = cveler
+            tum_cveler.update(cveler[:MAX_CVE_PER_ARTICLE])
 
     if not tum_cveler:
-        return {}
+        return {}, makale_cve_listesi
 
     log.info("Fetching %d CVE records for authoritative version data...", len(tum_cveler))
     with ThreadPoolExecutor(max_workers=8) as pool:
         pool.map(fetch_cve_record, tum_cveler)
 
     baglamlar: dict[str, str] = {}
-    for link, cveler in makale_cveleri.items():
-        bloklar = [f"{c}:\n{fetch_cve_record(c)}" for c in cveler if fetch_cve_record(c)]
+    for link, cveler in makale_cve_listesi.items():
+        bloklar = [f"{c}:\n{fetch_cve_record(c)}"
+                   for c in cveler[:MAX_CVE_PER_ARTICLE] if fetch_cve_record(c)]
         if bloklar:
             baglamlar[link] = "\n".join(bloklar)
     log.info("  %d/%d makale için resmi sürüm verisi bulundu",
              len(baglamlar), len(articles))
-    return baglamlar
+    return baglamlar, makale_cve_listesi
 
 
 def fetch_article_bodies(articles: list[dict]) -> tuple[dict[str, str], dict[str, str]]:
@@ -2057,7 +2084,28 @@ def assign_placeholder_images(
     return yeni_cid_map, list(kullanilanlar.items())
 
 
-def render_briefing_block(article: dict, analiz: dict, img_cid: str | None) -> str:
+def _cve_satiri(cveler: list[str] | None) -> str:
+    """Brifing bloğu için "CVE:" satırını üret — CVE yoksa BOŞ string.
+
+    Boş bir "CVE: —" satırı göstermek yerine satırı hiç basmıyoruz: 2026-09-22
+    ölçümünde makalelerin çoğunda (35'te 20) RSS metninde hiç CVE yoktu, her
+    bloğa boş bir alan eklemek brifingi gereksiz uzatırdı.
+
+    MAX_CVE_IN_BRIEFING üstü kırpılır ve kaç tane daha olduğu yazılır — bazı
+    toplu advisory'ler (Ubuntu kernel) 98 CVE içerebiliyor.
+    """
+    if not cveler:
+        return ""
+    gosterilen = [html.escape(c) for c in cveler[:MAX_CVE_IN_BRIEFING]]
+    kalan = len(cveler) - len(gosterilen)
+    metin = ", ".join(gosterilen)
+    if kalan > 0:
+        metin += f" <span style=\"color:#888;\">ve {kalan} tane daha</span>"
+    return f'\n  <p><strong>🔖 CVE:</strong> {metin}</p>'
+
+
+def render_briefing_block(article: dict, analiz: dict, img_cid: str | None,
+                          cveler: list[str] | None = None) -> str:
     """Bir makalenin analizinden HTML brifing bloğu üret.
 
     Modelden gelen HER alan html.escape()'ten geçer — model çıktısı hiçbir
@@ -2090,7 +2138,7 @@ def render_briefing_block(article: dict, analiz: dict, img_cid: str | None) -> s
   <h3 style="margin:0 0 8px 0;color:{renk};">[{html.escape(severite)}] {baslik}</h3>
   {gorsel}
   <p><strong>📅 Haber Tarihi:</strong> {html.escape(str(article.get('pubDate', 'Bilinmiyor')))}</p>
-  <p><strong>💾 Eşleşen Ürün:</strong> {html.escape(str(article.get('matched_product', '—')))}</p>
+  <p><strong>💾 Eşleşen Ürün:</strong> {html.escape(str(article.get('matched_product', '—')))}</p>{_cve_satiri(cveler)}
   <p><strong>🔴 Etkilenen Sürümler:</strong> {alan('etkilenen_surumler')}</p>
   <p><strong>🟢 Yamalı Sürümler:</strong> {alan('yamali_surumler')}</p>
   <p><strong>🎯 Etkilenen:</strong> {alan('etkilenen_kapsam')}</p>
@@ -2418,7 +2466,7 @@ def main() -> None:
 
         # Haber metni sürüm bilgisi için çoğu zaman yetersiz (bkz. fetch_cve_context
         # yorumu) — CVE'lerin resmi kayıtlarından yetkili sürüm verisini topla
-        cve_baglamlari = fetch_cve_context(top_matches, bodies)
+        cve_baglamlari, makale_cve_listesi = fetch_cve_context(top_matches, bodies)
 
         # Görsel adayları: RSS'ten gelen veya makale sayfasının og:image'i
         image_tasks = []
@@ -2505,7 +2553,9 @@ def main() -> None:
 
         # Brifing HTML'ini KOD üretir (model sadece veri döndürdü)
         briefing_html = "".join(
-            render_briefing_block(top_matches[index], analiz, cid_map.get(index))
+            render_briefing_block(
+                top_matches[index], analiz, cid_map.get(index),
+                makale_cve_listesi.get(top_matches[index].get("link", "")))
             for index, analiz in sirali
         )
 
